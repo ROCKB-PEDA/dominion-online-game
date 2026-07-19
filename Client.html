@@ -5918,12 +5918,23 @@ function renderTurnTimer(state) {
 
   clearInterval(timerIntervalId);
 
-  if (!timer.enabled) {
-    panel.classList.add('hidden');
-    return;
-  }
-
+  /*
+   * V25.2.1 Player Control：
+   * AI 接管／恢復真人是玩家控制功能，不應依賴是否啟用回合計時。
+   * 因此即使房間設定為「不限時間」，仍保留控制面板與按鈕。
+   */
   panel.classList.remove('hidden');
+
+  const viewerPlayer =
+    state.player || {};
+
+  const viewerIsPermanentAi =
+    Boolean(viewerPlayer.isAi);
+
+  const viewerAiControlled =
+    !viewerIsPermanentAi &&
+    Boolean(viewerPlayer.aiControlled);
+
   roomTimerPaused =
     Boolean(timer.paused);
   timerTimeoutRequested = false;
@@ -6010,20 +6021,16 @@ function renderTurnTimer(state) {
   if (reclaim) {
     reclaim.classList.toggle(
       'hidden',
-      !(
-        timer.isViewerOwner &&
-        timer.aiControlled
-      )
+      !viewerAiControlled ||
+      state.gameOver
     );
   }
 
   if (enableAi) {
     enableAi.classList.toggle(
       'hidden',
-      Boolean(
-        timer.isViewerOwner &&
-        timer.aiControlled
-      ) ||
+      viewerIsPermanentAi ||
+      viewerAiControlled ||
       state.gameOver
     );
   }
@@ -6031,12 +6038,48 @@ function renderTurnTimer(state) {
   if (modeSelect) {
     modeSelect.classList.toggle(
       'hidden',
-      Boolean(
-        timer.isViewerOwner &&
-        timer.aiControlled
-      ) ||
+      viewerIsPermanentAi ||
+      viewerAiControlled ||
       state.gameOver
     );
+  }
+
+  if (!timer.enabled) {
+    if (owner) {
+      owner.textContent =
+        viewerAiControlled
+          ? 'AI 持續接管中，按「恢復真人控制」才會停止'
+          : '不限時間模式';
+    }
+
+    const timerText =
+      document.getElementById(
+        'turnTimerText'
+      );
+
+    const timerProgress =
+      document.getElementById(
+        'turnTimerProgress'
+      );
+
+    if (timerText) {
+      timerText.textContent =
+        viewerAiControlled ? 'AI' : '∞';
+    }
+
+    if (timerProgress) {
+      timerProgress.style.width = '100%';
+    }
+
+    panel.classList.remove(
+      'timer-warning',
+      'timer-danger'
+    );
+
+    renderPendingBuyerTimers_({
+      isSimultaneousBuy:false,
+      pendingBuyers:[]
+    });
   }
 
   const pause =
@@ -6047,6 +6090,7 @@ function renderTurnTimer(state) {
   if (pause) {
     pause.classList.toggle(
       'hidden',
+      !timer.enabled ||
       state.playerRole !== 'host'
     );
 
@@ -6054,6 +6098,10 @@ function renderTurnTimer(state) {
       timer.paused
         ? '恢復計時'
         : '暫停計時';
+  }
+
+  if (!timer.enabled) {
+    return;
   }
 
   updateTurnTimerDisplay_(timer);
