@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <base target="_top">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+  <title>王國牌庫 V25.2 Safe Complete</title>
+  <?!= include('Style'); ?>
+</head>
+<body>
+  <main class="app">
+    <header class="title-area">
+      <h1>王國牌庫</h1>
+      <p>2～8 人多人線上版</p>
+    </header>
+
+    <?!= include('Views'); ?>
+  </main>
+
+  <div id="loading" class="loading hidden">
+    <div class="loading-box">處理中……</div>
+  </div>
+
+  <div id="message" class="message"></div>
+
+  <?!= include('FirebaseBridge'); ?>
+  <?!= include('Client'); ?>
+</body>
+</html>

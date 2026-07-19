@@ -1,0 +1,10 @@
+{
+  "getAiDifficultyProfile": 1,
+  "getAiDeckMetrics": 1,
+  "evaluateAiPurchase": 1,
+  "getAiBuyScore": 1,
+  "rankAiPurchaseCandidates": 1,
+  "chooseAiPurchaseCard": 1,
+  "chooseAiSupplyCard": 1,
+  "hasGainCandidate": 1
+}

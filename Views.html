@@ -1,0 +1,554 @@
+<section id="homeView" class="panel">
+  <h2 class="section-title">建立或加入遊戲</h2>
+
+  <div class="field">
+    <label for="playerName">你的名稱</label>
+    <input id="playerName" type="text" maxlength="12" placeholder="例如：小潘">
+  </div>
+
+  <div class="field">
+    <label>建立房間人數</label>
+    <div id="playerCountPicker" class="count-picker"></div>
+  </div>
+
+  <div class="field">
+    <label>王國卡模式</label>
+
+    <select
+      id="kingdomModeSelect"
+      class="kingdom-mode-select"
+      onchange="changeKingdomModeClient()"
+    >
+      <option value="balanced">均衡隨機 10 張（推薦）</option>
+      <option value="random">完全隨機 10 張</option>
+      <option value="beginner">新手模式</option>
+      <option value="attack">攻擊模式</option>
+      <option value="engine">引擎模式</option>
+      <option value="money">大錢流模式</option>
+      <option value="custom">自訂 10 張</option>
+      <option value="all">全部卡片模式</option>
+    </select>
+
+    <div id="kingdomModeDescription" class="kingdom-mode-description">
+      均衡配置抽牌、行動、經濟、精簡與攻擊卡。
+    </div>
+  </div>
+
+
+  <div class="room-rule-panel">
+    <div class="room-rule-title">回合計時</div>
+
+    <div class="field">
+      <label for="thinkTimeSelect">每次思考時間</label>
+      <select id="thinkTimeSelect" class="kingdom-mode-select">
+        <option value="0">不限制</option>
+        <option value="30">30 秒</option>
+        <option value="60">1 分鐘</option>
+        <option value="180">3 分鐘</option>
+        <option value="300">5 分鐘</option>
+        <option value="600">10 分鐘</option>
+      </select>
+      <div class="kingdom-mode-description">
+        每完成一次有效操作，倒數會重新開始。
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="timeoutModeSelect">時間到處理</label>
+      <select id="timeoutModeSelect" class="kingdom-mode-select">
+        <option value="ai">AI 暫時接管（推薦）</option>
+        <option value="finish">自動完成目前階段</option>
+        <option value="skip">自動略過目前互動</option>
+      </select>
+    </div>
+
+    <label class="timer-sound-option">
+      <input id="countdownSoundCheckbox" type="checkbox" checked>
+      最後 5 秒播放提示音
+    </label>
+  </div>
+
+  <div id="customKingdomPanel" class="custom-kingdom-panel hidden">
+    <div class="custom-kingdom-header">
+      <strong>自訂王國卡</strong>
+      <span id="customKingdomCount">已選 0 / 10</span>
+    </div>
+
+    <div class="custom-kingdom-actions">
+      <button type="button" class="btn btn-secondary" onclick="randomFillCustomKingdom()">隨機補滿</button>
+      <button type="button" class="btn btn-secondary" onclick="clearCustomKingdom()">全部取消</button>
+    </div>
+
+    <div id="customKingdomCards" class="custom-kingdom-cards"></div>
+  </div>
+
+  <div class="button-grid">
+    <button class="btn btn-primary" onclick="createRoomClient()">建立新房間</button>
+    <button class="btn btn-secondary" onclick="showJoinPanel()">輸入房號加入</button>
+  </div>
+
+  <div id="joinPanel" class="hidden join-panel">
+    <div class="field">
+      <label for="roomInput">四位數房號</label>
+      <input id="roomInput" class="room-input" type="text" maxlength="4" placeholder="0000" oninput="formatRoomInput(this)">
+    </div>
+
+    <button class="btn btn-primary full-width" onclick="joinRoomClient()">加入房間</button>
+  </div>
+</section>
+
+<section id="lobbyView" class="panel hidden">
+  <div class="room-number-box">
+    <small>邀請朋友輸入房號</small>
+    <div id="roomNumberText" class="room-number">0000</div>
+  </div>
+
+  <div id="roomStatus" class="status">等待玩家加入</div>
+
+  <div class="lobby-timer-summary">
+    <strong id="lobbyTimerRule">思考時間：不限制</strong>
+    <span id="lobbyTimeoutRule">時間到：AI 接管</span>
+  </div>
+
+  <div class="lobby-kingdom-summary">
+    <strong id="lobbyKingdomMode">王國卡模式</strong>
+    <div id="lobbyKingdomCards" class="lobby-kingdom-cards"></div>
+  </div>
+
+  <div id="lobbyPlayers" class="lobby-player-grid"></div>
+
+  <div id="aiLobbyControls" class="ai-lobby-controls hidden">
+    <div class="ai-control-title">加入 AI 玩家</div>
+
+    <div class="ai-difficulty-picker">
+      <button id="aiEasyButton" class="ai-difficulty-button" type="button" onclick="selectAiDifficulty('easy')">簡單</button>
+      <button id="aiNormalButton" class="ai-difficulty-button selected" type="button" onclick="selectAiDifficulty('normal')">普通</button>
+      <button id="aiHardButton" class="ai-difficulty-button" type="button" onclick="selectAiDifficulty('hard')">高手</button>
+    </div>
+
+    <button id="addAiButton" class="btn btn-secondary full-width" type="button" onclick="addAiPlayerClient()">＋ 加入 AI</button>
+  </div>
+
+  <div class="button-grid">
+    <button id="startButton" class="btn btn-primary hidden" onclick="startGameClient()" disabled>開始遊戲</button>
+    <button class="btn btn-danger" onclick="leaveRoomClient()">離開房間</button>
+  </div>
+</section>
+
+<section id="gameView" class="hidden">
+  <div class="game-layout">
+    <section class="panel game-main">
+      <div id="gameResultPanel" class="game-result-panel hidden">
+        <div class="result-icon">🏆</div>
+        <h2>遊戲結束</h2>
+        <div id="resultRanking"></div>
+      </div>
+
+      <div class="game-topbar">
+        <div>
+          <div class="game-small-label">房號</div>
+          <div id="gameRoomNumber" class="game-room-number">0000</div>
+        </div>
+
+        <div>
+          <div class="game-small-label">回合</div>
+          <div id="roundNumberText" class="turn-number">第 1 回合</div>
+        </div>
+
+        <button
+          id="openDeckInspectorButton"
+          class="btn btn-secondary deck-inspector-open-button"
+          type="button"
+          onclick="openDeckInspector()"
+        >
+          🃏 我的牌組
+        </button>
+      </div>
+
+
+      <div id="serverAdvanceStatus" class="server-advance-status hidden"></div>
+
+      <div id="turnTimerPanel" class="turn-timer-panel hidden">
+        <div class="turn-timer-row">
+          <div>
+            <small id="turnTimerOwner">目前思考玩家</small>
+            <strong id="turnTimerText">00:00</strong>
+          </div>
+
+          <div class="timer-control-buttons">
+            <select
+              id="aiControlModeSelect"
+              class="ai-control-mode-select"
+            >
+              <option value="balanced">AI：平衡</option>
+              <option value="conservative">AI：保守</option>
+              <option value="aggressive">AI：積極</option>
+            </select>
+
+            <button
+              id="enableAiControlButton"
+              class="btn btn-secondary"
+              type="button"
+              onclick="enableAiControlClient()"
+            >
+              🤖 AI 持續接管
+            </button>
+
+            <button
+              id="reclaimControlButton"
+              class="btn btn-secondary hidden"
+              type="button"
+              onclick="reclaimControlClient()"
+            >
+              👤 恢復真人控制
+            </button>
+
+            <button
+              id="pauseTimerButton"
+              class="btn btn-secondary hidden"
+              type="button"
+              onclick="toggleTimerPauseClient()"
+            >
+              暫停計時
+            </button>
+          </div>
+        </div>
+
+        <div class="turn-timer-track">
+          <div id="turnTimerProgress" class="turn-timer-progress"></div>
+        </div>
+
+        <div
+          id="pendingBuyerTimerList"
+          class="pending-buyer-timer-list hidden"
+        ></div>
+      </div>
+
+      <div class="phase-panel">
+        <div>
+          <small>目前階段</small>
+          <strong id="phaseText">行動階段</strong>
+        </div>
+
+        <div class="phase-player">
+          <small>目前行動玩家</small>
+          <strong id="activePlayerText">玩家</strong>
+        </div>
+      </div>
+
+      <div class="sync-row">
+        <div id="turnStatus" class="turn-status">讀取中……</div>
+        <div id="syncStatus" class="sync-status">同步中</div>
+      </div>
+
+      <div id="interactionPanel" class="interaction-panel hidden">
+        <h3 id="interactionTitle">等待卡片效果</h3>
+        <p id="interactionMessage"></p>
+
+        <div id="reactionButtons" class="interaction-actions hidden">
+          <button class="btn btn-primary" onclick="respondMoatClient(true)">展示護城河</button>
+          <button class="btn btn-secondary" onclick="respondMoatClient(false)">不展示</button>
+        </div>
+
+        <div id="handChoiceArea" class="hidden">
+          <div id="handChoiceCards" class="choice-card-grid"></div>
+          <button id="confirmHandChoiceButton" class="btn btn-primary full-width" onclick="submitHandChoiceClient()">確認選擇</button>
+          <button id="cancelHandChoiceButton" class="btn btn-secondary full-width interaction-cancel-button hidden" onclick="cancelInteractionClient()">放棄效果</button>
+        </div>
+
+        <div id="supplyChoiceArea" class="hidden">
+          <div id="supplyChoiceCards" class="supply-choice-cards"></div>
+          <button id="cancelSupplyChoiceButton" class="btn btn-secondary full-width interaction-cancel-button hidden" onclick="cancelInteractionClient()">放棄效果</button>
+        </div>
+
+
+        <div id="specialChoiceArea" class="special-choice-area hidden">
+          <div id="specialChoiceCards" class="special-choice-cards"></div>
+          <div id="specialChoiceButtons" class="special-choice-buttons"></div>
+        </div>
+      </div>
+
+      <div class="resource-panel">
+        <div class="resource-item"><small>行動</small><strong id="actionsText">1</strong></div>
+        <div class="resource-item"><small>購買</small><strong id="buysText">1</strong></div>
+        <div class="resource-item"><small>金錢</small><strong id="coinsText">0</strong></div>
+      </div>
+
+      <div class="supply-section">
+        <h3>供應區</h3>
+        <div id="supplyCards" class="supply-cards"></div>
+      </div>
+
+      <div class="play-section">
+        <h3>已打出區</h3>
+        <div id="playedCards" class="played-cards"></div>
+      </div>
+
+      <div class="hand-section">
+        <h3>你的手牌</h3>
+        <div id="handCards" class="hand-cards"></div>
+      </div>
+
+      <div class="own-card-counts">
+        <span>牌庫：<b id="ownDeckCount">0</b></span>
+        <span>棄牌：<b id="ownDiscardCount">0</b></span>
+      </div>
+
+      <button id="finishPhaseButton" class="btn btn-primary full-width top-gap" onclick="finishCurrentPhaseClient()" disabled>完成行動</button>
+      <button class="btn btn-danger full-width top-gap-small" onclick="leaveRoomClient()">離開遊戲</button>
+    </section>
+
+    <aside class="side-panel">
+      <section class="info-card">
+        <h3>👥 玩家狀態</h3>
+        <div id="gamePlayers" class="game-player-list"></div>
+      </section>
+
+      <section class="info-card">
+        <h3>🏆 勝負條件</h3>
+        <ol>
+          <li>行省牌堆歸零</li>
+          <li id="emptyPileRuleText">任意 3 個牌堆歸零</li>
+        </ol>
+        <div id="emptyPileStatus" class="empty-pile-status">目前空牌堆：0</div>
+      </section>
+
+      <section class="info-card">
+        <h3>📖 多人規則</h3>
+        <details open>
+          <summary>行動階段</summary>
+          <p>玩家依座位順序輪流完成行動。</p>
+        </details>
+        <details>
+          <summary>購買階段</summary>
+          <p>所有玩家可以同時購買。牌堆只剩少量時，以後端最先成功寫入者為準。</p>
+        </details>
+        <details>
+          <summary>新回合</summary>
+          <p>所有玩家都按完成購買後，全員清理、抽 5 張牌，開始下一回合。</p>
+        </details>
+      </section>
+
+      <section class="info-card">
+        <h3>📜 對局紀錄</h3>
+        <div id="gameLog" class="game-log">尚無紀錄</div>
+      </section>
+    </aside>
+  </div>
+</section>
+
+
+<div id="deckInspectorOverlay" class="deck-inspector-overlay hidden">
+  <div class="deck-inspector-panel">
+    <div class="deck-inspector-header">
+      <div>
+        <div class="deck-inspector-title">🃏 我的牌組</div>
+        <div class="deck-inspector-subtitle">查看自己目前擁有的卡片</div>
+      </div>
+
+      <button
+        class="deck-inspector-close"
+        type="button"
+        aria-label="關閉牌組查詢"
+        onclick="closeDeckInspector()"
+      >
+        ×
+      </button>
+    </div>
+
+    <div id="deckInspectorMetrics" class="deck-inspector-metrics"></div>
+
+    <div class="deck-inspector-controls">
+      <div class="deck-inspector-tabs">
+        <button class="deck-tab-button selected" type="button" data-deck-filter="all" onclick="setDeckInspectorFilter('all')">全部</button>
+        <button class="deck-tab-button" type="button" data-deck-filter="action" onclick="setDeckInspectorFilter('action')">行動卡</button>
+        <button class="deck-tab-button" type="button" data-deck-filter="treasure" onclick="setDeckInspectorFilter('treasure')">寶物</button>
+        <button class="deck-tab-button" type="button" data-deck-filter="victory" onclick="setDeckInspectorFilter('victory')">勝利卡</button>
+      </div>
+
+      <input
+        id="deckInspectorSearch"
+        class="deck-inspector-search"
+        type="search"
+        placeholder="搜尋卡片名稱或效果"
+        oninput="renderDeckInspector()"
+      >
+    </div>
+
+    <div id="deckInspectorList" class="deck-inspector-list"></div>
+
+    <div class="deck-inspector-footer">
+      <small>只顯示自己的牌組統計，不顯示牌庫排列順序。</small>
+      <button class="btn btn-primary" type="button" onclick="closeDeckInspector()">關閉</button>
+    </div>
+  </div>
+</div>
+
+<div id="winnerOverlay" class="winner-overlay hidden">
+  <div class="winner-confetti winner-confetti-a">✦</div>
+  <div class="winner-confetti winner-confetti-b">★</div>
+  <div class="winner-confetti winner-confetti-c">◆</div>
+  <div class="winner-confetti winner-confetti-d">✦</div>
+  <div class="winner-card">
+    <div class="winner-crown">👑</div>
+    <div class="winner-label">本局獲勝者</div>
+    <div id="winnerBigName" class="winner-big-name">玩家名稱</div>
+    <div id="winnerBigScore" class="winner-big-score">0 分</div>
+    <div id="winnerSubMessage" class="winner-sub-message">恭喜獲得勝利！</div>
+    <div id="winnerRankingPreview" class="winner-ranking-preview"></div>
+    <button class="btn btn-primary winner-close-button" type="button" onclick="closeWinnerOverlay()">查看完整結果</button>
+  </div>
+</div>
+
+<div
+  id="chatPanel"
+  class="chat-panel collapsed"
+>
+  <button
+    class="chat-toggle"
+    type="button"
+    onclick="toggleChatPanel()"
+  >
+    <span>💬 聊天室</span>
+    <span
+      id="chatUnreadBadge"
+      class="chat-unread-badge hidden"
+    >
+      0
+    </span>
+  </button>
+
+  <div class="chat-body">
+    <div class="chat-title-row">
+      <strong>房間聊天室</strong>
+      <span>最近 100 則</span>
+    </div>
+
+    <div
+      id="chatMessages"
+      class="chat-messages"
+      aria-live="polite"
+    >
+      <div class="chat-empty">
+        目前還沒有訊息
+      </div>
+    </div>
+
+    <div class="chat-compose">
+      <textarea
+        id="chatInput"
+        maxlength="200"
+        rows="2"
+        placeholder="輸入訊息，Enter 送出"
+      ></textarea>
+
+      <button
+        class="btn btn-primary chat-send-button"
+        type="button"
+        onclick="sendChatMessageClient()"
+      >
+        送出
+      </button>
+    </div>
+
+    <div class="chat-hint">
+      每則最多 200 字，1 秒內限送一次
+    </div>
+  </div>
+</div>
+
+<div id="firebaseDebugPanel" class="firebase-debug-panel collapsed">
+  <button
+    class="firebase-debug-toggle"
+    type="button"
+    onclick="toggleFirebaseDebugPanel()"
+  >
+    Firebase
+  </button>
+
+  <div class="firebase-debug-body">
+    <div class="firebase-debug-title">
+      Firebase 連線診斷
+    </div>
+
+    <div class="firebase-debug-row"><span>狀態</span><strong id="firebaseDebugStatus">尚未連線</strong></div>
+    <div class="firebase-debug-row"><span>房號</span><strong id="firebaseDebugRoom">—</strong></div>
+    <div class="firebase-debug-row"><span>玩家 ID</span><strong id="firebaseDebugPlayer">—</strong></div>
+    <div class="firebase-debug-row"><span>在線玩家</span><strong id="firebaseDebugOnline">0 / 0</strong></div>
+    <div class="firebase-debug-row"><span>送出訊號</span><strong id="firebaseDebugSent">0</strong></div>
+    <div class="firebase-debug-row"><span>收到訊號</span><strong id="firebaseDebugReceived">0</strong></div>
+    <div class="firebase-debug-row"><span>Firebase 寫入</span><strong id="firebaseDebugWriteLatency">—</strong></div>
+    <div class="firebase-debug-row"><span>Apps Script 快照</span><strong id="firebaseDebugSnapshotLatency">—</strong></div>
+    <div class="firebase-debug-row"><span>完整同步</span><strong id="firebaseDebugTotalLatency">—</strong></div>
+    <div class="firebase-debug-row"><span>活躍分頁</span><strong id="firebaseDebugSessions">0</strong></div>
+    <div class="firebase-debug-row"><span>伺服器快取</span><strong id="firebaseDebugCacheHit">—</strong></div>
+    <div class="firebase-debug-row"><span>房間載入</span><strong id="firebaseDebugRoomLoad">—</strong></div>
+    <div class="firebase-debug-row"><span>伺服器總計</span><strong id="firebaseDebugServerTotal">—</strong></div>
+    <div class="firebase-debug-row"><span>同步架構</span><strong>V22.5 事件＋權威狀態</strong></div>
+    <div class="firebase-debug-row"><span>狀態版本</span><strong id="firebaseDebugStateVersion">0</strong></div>
+    <div class="firebase-debug-row"><span>狀態 Hash</span><strong id="firebaseDebugStateHash">—</strong></div>
+    <div class="firebase-debug-row"><span>送出封包</span><strong id="firebaseDebugPacketsSent">0</strong></div>
+    <div class="firebase-debug-row"><span>收到封包</span><strong id="firebaseDebugPacketsReceived">0</strong></div>
+    <div class="firebase-debug-row"><span>過期狀態阻擋</span><strong id="firebaseDebugStaleDrops">0</strong></div>
+    <div class="firebase-debug-row"><span>事件延遲</span><strong id="firebaseDebugEventDelay">—</strong></div>
+    <div class="firebase-debug-row"><span>最後送出</span><strong id="firebaseDebugLastSent">—</strong></div>
+    <div class="firebase-debug-row"><span>最後收到</span><strong id="firebaseDebugLastReceived">—</strong></div>
+
+    <div class="firebase-debug-error">
+      <span>最近錯誤</span>
+      <div id="firebaseDebugError">無</div>
+    </div>
+
+    <div class="firebase-debug-actions">
+      <button class="btn btn-secondary firebase-debug-test" type="button" onclick="sendFirebaseDebugSignal()">測試 Firebase 寫入</button>
+      <button class="btn btn-secondary firebase-debug-test" type="button" onclick="testFirebaseSnapshot()">測試 Apps Script 快照</button>
+      <button class="btn btn-primary firebase-debug-test" type="button" onclick="testFirebaseFullSync()">完整同步測試</button>
+    </div>
+    <div class="firebase-debug-events-title">V24.4 AI Action Engine</div>
+    <div class="firebase-debug-row"><span>目前 AI</span><strong id="aiActionEngineStatus">尚無行動評分</strong></div>
+    <div id="aiActionEngineCandidates" class="ai-engine-candidates">
+      <div class="firebase-debug-empty">尚無 AI 行動評分紀錄</div>
+    </div>
+
+<div class="firebase-debug-events-title">V24.3 AI Engine</div>
+    <div class="firebase-debug-row"><span>狀態</span><strong id="aiEngineStatus">沒有 AI</strong></div>
+    <div id="aiEngineCandidates" class="ai-engine-candidates">
+      <div class="firebase-debug-empty">尚無購牌評分紀錄</div>
+    </div>
+
+<div class="firebase-debug-events-title">Safe Complete</div>
+    <div class="firebase-debug-row"><span>累計次數</span><strong id="safeCompleteCount">0</strong></div>
+    <div id="safeCompleteRecent" class="safe-complete-list"><div class="firebase-debug-empty">尚無 Safe Complete 紀錄</div></div>
+
+<div class="firebase-debug-events-title">Room Health</div>
+    <div class="firebase-debug-row"><span>狀態</span><strong id="roomHealthStatus">正常</strong></div>
+    <div class="firebase-debug-row"><span>可操作玩家</span><strong id="roomHealthActionable">0</strong></div>
+    <div class="firebase-debug-row"><span>Interaction</span><strong id="roomHealthInteraction">0</strong></div>
+    <div class="firebase-debug-row"><span>Effect Stack</span><strong id="roomHealthEffect">0</strong></div>
+    <div class="firebase-debug-row"><span>Attack Sequence</span><strong id="roomHealthAttack">0</strong></div>
+    <div class="firebase-debug-row"><span>最後修復</span><strong id="roomHealthRepair">無</strong></div>
+    <div class="firebase-debug-row"><span>房間資料</span><strong id="roomHealthDataSize">0 KB</strong></div>
+    <button
+      id="repairRoomButton"
+      type="button"
+      class="firebase-debug-button"
+      onclick="repairRoomClient()"
+    >
+      修復房間
+    </button>
+
+<div class="firebase-debug-events-title">Attack Engine</div>
+    <div class="firebase-debug-row"><span>來源卡片</span><strong id="attackEngineSource">—</strong></div>
+    <div class="firebase-debug-row"><span>目標進度</span><strong id="attackEngineProgress">0 / 0</strong></div>
+    <div class="firebase-debug-row"><span>狀態</span><strong id="attackEngineStatus">閒置</strong></div>
+
+<div class="firebase-debug-events-title">V24 Effect Engine</div>
+    <div class="firebase-debug-row"><span>引擎版本</span><strong id="effectEngineVersion">0</strong></div>
+    <div class="firebase-debug-row"><span>堆疊深度</span><strong id="effectStackDepth">0</strong></div>
+    <div class="firebase-debug-row"><span>堆疊版本</span><strong id="effectStackVersion">0</strong></div>
+    <div id="effectStackFrames" class="effect-stack-frames"><div class="firebase-debug-empty">效果堆疊為空</div></div>
+    <button id="repairEffectStackButton" class="btn btn-danger firebase-debug-test hidden" type="button" onclick="repairEffectStackClient()">重新推進效果堆疊</button>
+    <div class="firebase-debug-events-title">最近同步事件</div>
+    <div id="firebaseDebugEvents" class="firebase-debug-events"><div class="firebase-debug-empty">尚無事件</div></div>
+  </div>
+</div>

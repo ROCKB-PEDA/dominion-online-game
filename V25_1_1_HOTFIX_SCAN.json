@@ -1,0 +1,7 @@
+{
+  "room_health_present": 1,
+  "try_gain_card_definitions": 1,
+  "gain_card_definitions": 1,
+  "empty_pile_precheck": 1,
+  "attack_gain_empty_outcome": 1
+}

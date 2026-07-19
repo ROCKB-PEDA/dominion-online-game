@@ -1,0 +1,6 @@
+{
+  "auto_resolve_timeout_definitions": 1,
+  "broken_discard_type_checks": 0,
+  "correct_discard_type_checks": 1,
+  "timeout_finish_interaction_branches": 2
+}

@@ -1,0 +1,11 @@
+{
+  "room_columns": 15,
+  "json_chunk_count": 10,
+  "json_chunk_size": 45000,
+  "max_json_characters": 450000,
+  "encode_chunk_definitions": 1,
+  "decode_chunk_definitions": 1,
+  "save_context_definitions": 1,
+  "direct_old_decode_values3": 0,
+  "direct_old_decode_values_i3": 0
+}

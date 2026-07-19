@@ -1,0 +1,6570 @@
+<script>
+const STORAGE_KEYS = {
+  playerId:'deckGamePlayerId',
+  playerName:'deckGamePlayerName',
+  roomNumber:'deckGameRoomNumber'
+};
+
+const SNAPSHOT_POLL_INTERVAL_MS = 60000;
+const ACTION_MAX_RETRIES = 4;
+const ACTION_RETRY_DELAY_MS = 350;
+const FIREBASE_DEBUG_MODE = true;
+const FIREBASE_DEBUG_PANEL_STORAGE_KEY = 'kingdom.firebaseDebugOpen';
+const CHAT_PANEL_STORAGE_KEY = 'kingdom.chatOpen';
+const CHAT_LAST_READ_STORAGE_PREFIX = 'kingdom.chatLastRead.';
+const CHAT_SEND_COOLDOWN_MS = 1000;
+
+let playerId = '';
+let currentRoomNumber = '';
+let selectedMaxPlayers = 2;
+let selectedKingdomMode = 'balanced';
+let selectedCustomKingdomIds = [];
+let homeCardCatalog = {};
+let currentPhase = 'waiting';
+let latestGameState = null;
+let cardCatalog = {};
+let selectedIndexes = [];
+let pollingTimer = null;
+let actionInProgress = false;
+let messageTimer = null;
+let loadingSafetyTimer = null;
+let lastShownResultKey = '';
+let selectedAiDifficulty = 'normal';
+let aiStepInProgress = false;
+let aiStepTimer = null;
+let latestLobbyPlayerRole = '';
+let deckInspectorFilter = 'all';
+let deckInspectorOpen = false;
+let timerIntervalId = null;
+let timerTimeoutRequested = false;
+let lastTimerSecond = null;
+let roomTimerPaused = false;
+let actionWatchdogTimer = null;
+let actionTaskSerial = 0;
+let reconnectReclaimRequested = false;
+let optimisticPhaseSnapshot = null;
+let firebasePrivateReconcileTimer = null;
+let firebaseActionPending = null;
+let firebaseEventCount = 0;
+let firebaseLastEventAt = 0;
+let interactionLockState = {
+  locked:false,
+  interactionId:'',
+  reason:'',
+  lockedAt:0,
+  submitSerial:0
+};
+let lastRenderedInteractionId = '';
+let interactionEventLog = [];
+let lastEffectStackProgressAt = Date.now();
+let lastEffectStackSignature = '';
+let syncRequestSerial = 0;
+let syncWatchdogTimer = null;
+let aiWatchdogTimer = null;
+let knownRoomVersion = -1;
+let snapshotSyncInProgress = false;
+let pendingActions = [];
+let currentActionTask = null;
+let chatMessages = [];
+let chatUnreadCount = 0;
+let chatLastSentAt = 0;
+let chatLastReceivedTimestamp = 0;
+
+document.addEventListener('DOMContentLoaded', initializeApp);
+
+
+function initializeChatPanel() {
+  const panel =
+    document.getElementById(
+      'chatPanel'
+    );
+
+  if (!panel) return;
+
+  const stored =
+    localStorage.getItem(
+      CHAT_PANEL_STORAGE_KEY
+    );
+
+  panel.classList.toggle(
+    'collapsed',
+    stored !== 'true'
+  );
+
+  updateChatUnreadBadge_();
+
+  const input =
+    document.getElementById(
+      'chatInput'
+    );
+
+  if (input) {
+    input.addEventListener(
+      'keydown',
+      function(event) {
+        if (
+          event.key === 'Enter' &&
+          !event.shiftKey
+        ) {
+          event.preventDefault();
+          sendChatMessageClient();
+        }
+      }
+    );
+  }
+}
+
+
+
+function toggleChatPanel() {
+  const panel =
+    document.getElementById(
+      'chatPanel'
+    );
+
+  if (!panel) return;
+
+  const collapsed =
+    panel.classList.toggle(
+      'collapsed'
+    );
+
+  localStorage.setItem(
+    CHAT_PANEL_STORAGE_KEY,
+    String(!collapsed)
+  );
+
+  if (!collapsed) {
+    markChatAsRead_();
+
+    setTimeout(function() {
+      const input =
+        document.getElementById(
+          'chatInput'
+        );
+
+      if (input) input.focus();
+
+      scrollChatToBottom_();
+    }, 0);
+  }
+}
+
+function getChatPlayerName_() {
+  const stored =
+    localStorage.getItem(
+      STORAGE_KEYS.playerName
+    );
+
+  if (stored && stored.trim()) {
+    return stored.trim();
+  }
+
+  if (
+    latestGameState &&
+    latestGameState.player &&
+    latestGameState.player.name
+  ) {
+    return latestGameState.player.name;
+  }
+
+  return '玩家';
+}
+
+function getChatReadKey_() {
+  return (
+    CHAT_LAST_READ_STORAGE_PREFIX +
+    String(currentRoomNumber || '')
+  );
+}
+
+function markChatAsRead_() {
+  chatUnreadCount = 0;
+
+  localStorage.setItem(
+    getChatReadKey_(),
+    String(
+      chatLastReceivedTimestamp ||
+      Date.now()
+    )
+  );
+
+  updateChatUnreadBadge_();
+}
+
+function updateChatUnreadBadge_() {
+  const badge =
+    document.getElementById(
+      'chatUnreadBadge'
+    );
+
+  if (!badge) return;
+
+  badge.textContent =
+    chatUnreadCount > 99
+      ? '99+'
+      : String(chatUnreadCount);
+
+  badge.classList.toggle(
+    'hidden',
+    chatUnreadCount <= 0
+  );
+}
+
+function formatChatTime_(timestamp) {
+  if (!timestamp) return '';
+
+  try {
+    return new Date(timestamp)
+      .toLocaleTimeString(
+        'zh-TW',
+        {
+          hour:'2-digit',
+          minute:'2-digit',
+          hour12:false
+        }
+      );
+  } catch (error) {
+    return '';
+  }
+}
+
+function renderChatMessages_() {
+  const container =
+    document.getElementById(
+      'chatMessages'
+    );
+
+  if (!container) return;
+
+  container.innerHTML =
+    chatMessages.length
+      ? chatMessages.map(
+          function(message) {
+            const isSelf =
+              message.playerId ===
+                playerId;
+
+            const classNames = [
+              'chat-message',
+              message.type === 'system'
+                ? 'system'
+                : (
+                    isSelf
+                      ? 'self'
+                      : 'other'
+                  )
+            ].join(' ');
+
+            if (message.type === 'system') {
+              return (
+                '<div class="' +
+                classNames +
+                '">' +
+                '<div class="chat-system-text">' +
+                escapeHtml(
+                  message.text || ''
+                ) +
+                '</div>' +
+                '<span>' +
+                escapeHtml(
+                  formatChatTime_(
+                    message.createdAt ||
+                    message.clientCreatedAt
+                  )
+                ) +
+                '</span>' +
+                '</div>'
+              );
+            }
+
+            return (
+              '<div class="' +
+              classNames +
+              '">' +
+              '<div class="chat-message-header">' +
+              '<strong>' +
+              escapeHtml(
+                message.playerName ||
+                '玩家'
+              ) +
+              '</strong>' +
+              '<span>' +
+              escapeHtml(
+                formatChatTime_(
+                  message.createdAt ||
+                  message.clientCreatedAt
+                )
+              ) +
+              '</span>' +
+              '</div>' +
+              '<div class="chat-message-text">' +
+              escapeHtml(
+                message.text || ''
+              ) +
+              '</div>' +
+              '</div>'
+            );
+          }
+        ).join('')
+      : '<div class="chat-empty">目前還沒有訊息</div>';
+
+  scrollChatToBottom_();
+}
+
+function scrollChatToBottom_() {
+  const container =
+    document.getElementById(
+      'chatMessages'
+    );
+
+  if (!container) return;
+
+  container.scrollTop =
+    container.scrollHeight;
+}
+
+function handleFirebaseChatMessage(
+  message
+) {
+  if (!message) return;
+
+  const exists =
+    chatMessages.some(
+      function(item) {
+        return (
+          item.id &&
+          item.id === message.id
+        );
+      }
+    );
+
+  if (exists) return;
+
+  chatMessages.push(message);
+
+  if (chatMessages.length > 100) {
+    chatMessages.splice(
+      0,
+      chatMessages.length - 100
+    );
+  }
+
+  const timestamp =
+    Number(
+      message.createdAt ||
+      message.clientCreatedAt ||
+      Date.now()
+    );
+
+  chatLastReceivedTimestamp =
+    Math.max(
+      chatLastReceivedTimestamp,
+      timestamp
+    );
+
+  const panel =
+    document.getElementById(
+      'chatPanel'
+    );
+
+  const collapsed =
+    !panel ||
+    panel.classList.contains(
+      'collapsed'
+    );
+
+  const lastRead =
+    Number(
+      localStorage.getItem(
+        getChatReadKey_()
+      ) || 0
+    );
+
+  if (
+    message.playerId !== playerId &&
+    timestamp > lastRead &&
+    collapsed
+  ) {
+    chatUnreadCount += 1;
+    updateChatUnreadBadge_();
+  } else if (!collapsed) {
+    markChatAsRead_();
+  }
+
+  renderChatMessages_();
+}
+
+function sendChatMessageClient() {
+  const input =
+    document.getElementById(
+      'chatInput'
+    );
+
+  if (!input) return;
+
+  if (!currentRoomNumber) {
+    showMessage(
+      '請先進入房間再使用聊天室。',
+      true
+    );
+    return;
+  }
+
+  const text =
+    String(input.value || '')
+      .trim();
+
+  if (!text) return;
+
+  if (text.length > 200) {
+    showMessage(
+      '每則訊息最多 200 個字。',
+      true
+    );
+    return;
+  }
+
+  const now = Date.now();
+
+  if (
+    now - chatLastSentAt <
+      CHAT_SEND_COOLDOWN_MS
+  ) {
+    showMessage(
+      '訊息發送太快，請稍等一下。',
+      true
+    );
+    return;
+  }
+
+  if (
+    typeof firebaseBridgeSendChatMessage !==
+      'function'
+  ) {
+    showMessage(
+      'Firebase 聊天室尚未初始化。',
+      true
+    );
+    return;
+  }
+
+  chatLastSentAt = now;
+  input.disabled = true;
+
+  firebaseBridgeSendChatMessage(
+    getChatPlayerName_(),
+    text,
+    'player'
+  ).then(function(result) {
+    input.disabled = false;
+
+    if (
+      !result ||
+      !result.success
+    ) {
+      showMessage(
+        result && result.message
+          ? result.message
+          : '訊息送出失敗。',
+        true
+      );
+
+      input.focus();
+      return;
+    }
+
+    input.value = '';
+    input.focus();
+  });
+}
+
+function resetChatForRoom_() {
+  chatMessages = [];
+  chatUnreadCount = 0;
+  chatLastReceivedTimestamp = 0;
+  renderChatMessages_();
+  updateChatUnreadBadge_();
+}
+
+function initializeFirebaseDebugPanel() {
+  const panel = document.getElementById('firebaseDebugPanel');
+  if (panel) {
+    panel.classList.toggle('hidden',!FIREBASE_DEBUG_MODE);
+    const stored = localStorage.getItem(FIREBASE_DEBUG_PANEL_STORAGE_KEY);
+    panel.classList.toggle('collapsed',stored !== 'true');
+  }
+  if (typeof firebaseBridgeSubscribeDebug === 'function') {
+    firebaseBridgeSubscribeDebug(renderFirebaseDebugState);
+  }
+}
+
+function toggleFirebaseDebugPanel() {
+  const panel = document.getElementById('firebaseDebugPanel');
+  if (panel) {
+    const collapsed = panel.classList.toggle('collapsed');
+    localStorage.setItem(FIREBASE_DEBUG_PANEL_STORAGE_KEY,String(!collapsed));
+  }
+}
+
+function setFirebaseDebugText_(id, value) {
+  const element = document.getElementById(id);
+
+  if (element) {
+    element.textContent = String(value);
+  }
+}
+
+function renderFirebaseDebugState(state) {
+  state = state || {};
+
+  const status =
+    document.getElementById('firebaseDebugStatus');
+
+  if (!status) return;
+
+  let text = '🔴 已離線';
+  let className = 'firebase-debug-status-offline';
+
+  if (state.connected) {
+    text = '🟢 已連線';
+    className = 'firebase-debug-status-online';
+  } else if (state.reconnecting) {
+    text = '🟡 重新連線中';
+    className = 'firebase-debug-status-reconnecting';
+  }
+
+  status.textContent = text;
+  status.className = className;
+
+  setFirebaseDebugText_('firebaseDebugRoom', state.roomNumber || '—');
+  setFirebaseDebugText_('firebaseDebugPlayer', state.playerId || '—');
+  setFirebaseDebugText_(
+    'firebaseDebugOnline',
+    String(Number(state.onlineCount || 0)) +
+      ' / ' +
+      String(Number(state.totalPresenceCount || 0))
+  );
+  setFirebaseDebugText_('firebaseDebugSent', state.sentCount || 0);
+  setFirebaseDebugText_('firebaseDebugReceived', state.receivedCount || 0);
+  setFirebaseDebugText_(
+    'firebaseDebugLatency',
+    state.latencyMs == null
+      ? '—'
+      : state.latencyMs + ' ms'
+  );
+  setFirebaseDebugText_('firebaseDebugLastSent', state.lastSentAt || '—');
+  setFirebaseDebugText_('firebaseDebugLastReceived', state.lastReceivedAt || '—');
+  setFirebaseDebugText_('firebaseDebugError', state.lastError || '無');
+  setFirebaseDebugText_('firebaseDebugWriteLatency',state.firebaseWriteMs == null ? '—' : state.firebaseWriteMs + ' ms');
+  setFirebaseDebugText_('firebaseDebugSnapshotLatency',state.appsScriptSnapshotMs == null ? '—' : state.appsScriptSnapshotMs + ' ms');
+  setFirebaseDebugText_('firebaseDebugTotalLatency',state.totalSyncMs == null ? '—' : state.totalSyncMs + ' ms');
+  setFirebaseDebugText_('firebaseDebugSessions',state.activeSessionCount || 0);
+  setFirebaseDebugText_(
+    'firebaseDebugCacheHit',
+    state.serverCacheHit == null
+      ? '—'
+      : (
+          state.serverCacheHit
+            ? '命中'
+            : '未命中'
+        )
+  );
+  setFirebaseDebugText_(
+    'firebaseDebugRoomLoad',
+    state.serverRoomLoadMs == null
+      ? '—'
+      : state.serverRoomLoadMs + ' ms'
+  );
+  setFirebaseDebugText_(
+    'firebaseDebugServerTotal',
+    state.serverTotalMs == null
+      ? '—'
+      : state.serverTotalMs + ' ms'
+  );
+  setFirebaseDebugText_(
+    'firebaseDebugStateVersion',
+    state.roomStateVersion || 0
+  );
+  setFirebaseDebugText_(
+    'firebaseDebugStateHash',
+    state.roomStateHash || '—'
+  );
+  setFirebaseDebugText_(
+    'firebaseDebugPacketsSent',
+    state.packetsSent || 0
+  );
+  setFirebaseDebugText_(
+    'firebaseDebugPacketsReceived',
+    state.packetsReceived || 0
+  );
+  setFirebaseDebugText_(
+    'firebaseDebugStaleDrops',
+    state.staleStateDrops || 0
+  );
+  setFirebaseDebugText_(
+    'firebaseDebugEventDelay',
+    state.realtimeEventDelayMs == null
+      ? '—'
+      : state.realtimeEventDelayMs + ' ms'
+  );
+
+  renderFirebaseDebugEvents_(state.events || []);
+  if (state.lastError || state.reconnecting) {
+    const panel = document.getElementById('firebaseDebugPanel');
+    if (panel) {
+      panel.classList.remove('collapsed');
+      localStorage.setItem(FIREBASE_DEBUG_PANEL_STORAGE_KEY,'true');
+    }
+  }
+}
+
+function renderFirebaseDebugEvents_(events) {
+  const container = document.getElementById('firebaseDebugEvents');
+  if (!container) return;
+  const list = Array.isArray(events) ? events.slice().reverse() : [];
+  container.innerHTML = list.length ? list.map(function(event){
+    return '<div class="firebase-debug-event ' + escapeHtml(event.type || 'info') + '"><span>' + escapeHtml(event.time || '') + '</span><div>' + escapeHtml(event.text || '') + '</div></div>';
+  }).join('') : '<div class="firebase-debug-empty">尚無事件</div>';
+}
+
+function sendFirebaseDebugSignal() {
+  if (
+    typeof firebaseBridgeSendTestSignal !==
+      'function'
+  ) {
+    showMessage('Firebase 尚未初始化。', true);
+    return;
+  }
+
+  firebaseBridgeSendTestSignal()
+    .then(function(success) {
+      showMessage(
+        success
+          ? 'Firebase 測試訊號已送出。'
+          : 'Firebase 測試訊號失敗。',
+        !success
+      );
+    });
+}
+
+function testFirebaseSnapshot() {
+  if (typeof firebaseBridgeTestSnapshot !== 'function') return;
+  firebaseBridgeTestSnapshot().then(function(ok){showMessage(ok ? 'Apps Script 快照測試完成。' : '快照測試失敗。',!ok);});
+}
+
+function testFirebaseFullSync() {
+  if (typeof firebaseBridgeTestFullSync !== 'function') return;
+  firebaseBridgeTestFullSync().then(function(ok){showMessage(ok ? '完整同步測試完成。' : '完整同步測試失敗。',!ok);});
+}
+
+function renderFirebasePresenceState(presenceMap) {
+  if (
+    !latestGameState ||
+    !Array.isArray(latestGameState.players)
+  ) {
+    return;
+  }
+
+  latestGameState.players.forEach(function(player) {
+    const key =
+      String(player.id || '')
+        .replace(/[.#$\[\]\/]/g, '_')
+        .substring(0, 80);
+
+    const presence =
+      presenceMap && presenceMap[key];
+
+    player.firebaseOnline =
+      Boolean(
+        presence &&
+        presence.online
+      );
+  });
+
+  renderPlayers(latestGameState);
+}
+
+function initializeApp() {
+  initializeChatPanel();
+  playerId = getOrCreatePlayerId();
+  initializeFirebaseDebugPanel();
+  renderPlayerCountPicker();
+  loadHomeCardCatalog();
+  changeKingdomModeClient();
+
+  document.getElementById('playerName').value =
+    localStorage.getItem(STORAGE_KEYS.playerName) || '';
+
+  const savedRoom =
+    localStorage.getItem(STORAGE_KEYS.roomNumber) || '';
+
+  if (savedRoom) {
+    currentRoomNumber = savedRoom;
+    showLobby();
+    syncClientState(true);
+    startPolling();
+  }
+}
+
+function renderPlayerCountPicker() {
+  const container =
+    document.getElementById('playerCountPicker');
+
+  container.innerHTML = '';
+
+  for (let count = 2; count <= 8; count++) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className =
+      'count-button' +
+      (count === selectedMaxPlayers ? ' selected' : '');
+    button.textContent = count + ' 人';
+
+    button.onclick = function() {
+      selectedMaxPlayers = count;
+      renderPlayerCountPicker();
+    };
+
+    container.appendChild(button);
+  }
+}
+
+
+function loadHomeCardCatalog() {
+  google.script.run
+    .withSuccessHandler(function(catalog) {
+      homeCardCatalog = catalog || {};
+      renderCustomKingdomCards();
+    })
+    .withFailureHandler(function(error) {
+      console.error('讀取卡片清單失敗：', error);
+    })
+    .getPublicCardCatalog();
+}
+
+function changeKingdomModeClient() {
+  const select =
+    document.getElementById(
+      'kingdomModeSelect'
+    );
+
+  if (select) {
+    selectedKingdomMode = select.value;
+  }
+
+  const descriptions = {
+    balanced:'均衡配置抽牌、行動、經濟、精簡與攻擊卡。',
+    random:'從所有已實作王國卡中完全隨機挑選 10 張。',
+    beginner:'使用較單純、容易理解的 10 張卡。',
+    attack:'包含多張攻擊卡與護城河。',
+    engine:'偏向村莊、實驗室、市集與寶座廳的連鎖玩法。',
+    money:'偏向寶物、經濟與勝利卡的玩法。',
+    custom:'房主自行選擇剛好 10 張王國卡。',
+    all:'所有 25 張王國卡都放入供應區，空 6 堆才結束。'
+  };
+
+  const description =
+    document.getElementById(
+      'kingdomModeDescription'
+    );
+
+  if (description) {
+    description.textContent =
+      descriptions[selectedKingdomMode] ||
+      descriptions.balanced;
+  }
+
+  const panel =
+    document.getElementById(
+      'customKingdomPanel'
+    );
+
+  if (panel) {
+    panel.classList.toggle(
+      'hidden',
+      selectedKingdomMode !== 'custom'
+    );
+  }
+
+  renderCustomKingdomCards();
+}
+
+function getHomeKingdomCards() {
+  return Object.keys(homeCardCatalog)
+    .filter(function(cardId) {
+      return homeCardCatalog[cardId].isKingdom;
+    })
+    .sort(function(leftId, rightId) {
+      return (
+        Number(homeCardCatalog[leftId].supplyOrder || 999) -
+        Number(homeCardCatalog[rightId].supplyOrder || 999)
+      );
+    });
+}
+
+function renderCustomKingdomCards() {
+  const container =
+    document.getElementById(
+      'customKingdomCards'
+    );
+
+  if (!container) return;
+
+  container.innerHTML = '';
+
+  getHomeKingdomCards().forEach(function(cardId) {
+    const card = homeCardCatalog[cardId];
+    const button =
+      document.createElement('button');
+
+    button.type = 'button';
+    button.className =
+      'custom-card-option' +
+      (
+        selectedCustomKingdomIds
+          .indexOf(cardId) !== -1
+          ? ' selected'
+          : ''
+      );
+
+    button.innerHTML =
+      '<strong>' +
+      escapeHtml(card.name) +
+      '（' +
+      Number(card.cost || 0) +
+      '）</strong><small>' +
+      escapeHtml(card.description) +
+      '</small>';
+
+    button.onclick = function() {
+      toggleCustomKingdomCard(cardId);
+    };
+
+    container.appendChild(button);
+  });
+
+  const count =
+    document.getElementById(
+      'customKingdomCount'
+    );
+
+  if (count) {
+    count.textContent =
+      '已選 ' +
+      selectedCustomKingdomIds.length +
+      ' / 10';
+  }
+}
+
+function toggleCustomKingdomCard(cardId) {
+  const index =
+    selectedCustomKingdomIds
+      .indexOf(cardId);
+
+  if (index !== -1) {
+    selectedCustomKingdomIds
+      .splice(index, 1);
+  } else if (
+    selectedCustomKingdomIds.length < 10
+  ) {
+    selectedCustomKingdomIds.push(cardId);
+  } else {
+    showMessage(
+      '自訂王國最多只能選 10 張。',
+      true
+    );
+  }
+
+  renderCustomKingdomCards();
+}
+
+function clearCustomKingdom() {
+  selectedCustomKingdomIds = [];
+  renderCustomKingdomCards();
+}
+
+function randomFillCustomKingdom() {
+  const pool =
+    getHomeKingdomCards()
+      .filter(function(cardId) {
+        return (
+          selectedCustomKingdomIds
+            .indexOf(cardId) === -1
+        );
+      });
+
+  for (
+    let i = pool.length - 1;
+    i > 0;
+    i--
+  ) {
+    const index =
+      Math.floor(
+        Math.random() * (i + 1)
+      );
+
+    const temp = pool[i];
+    pool[i] = pool[index];
+    pool[index] = temp;
+  }
+
+  pool.forEach(function(cardId) {
+    if (
+      selectedCustomKingdomIds.length < 10
+    ) {
+      selectedCustomKingdomIds.push(cardId);
+    }
+  });
+
+  renderCustomKingdomCards();
+}
+
+function getOrCreatePlayerId() {
+  let id =
+    localStorage.getItem(STORAGE_KEYS.playerId);
+
+  if (!id) {
+    id =
+      window.crypto &&
+      typeof window.crypto.randomUUID === 'function'
+        ? window.crypto.randomUUID()
+        : 'player-' +
+          Date.now() +
+          '-' +
+          Math.random().toString(36).slice(2);
+
+    localStorage.setItem(
+      STORAGE_KEYS.playerId,
+      id
+    );
+  }
+
+  return id;
+}
+
+function getPlayerName() {
+  return document
+    .getElementById('playerName')
+    .value
+    .trim();
+}
+
+function createRoomClient() {
+  const playerName = getPlayerName();
+
+  if (!playerName) {
+    showMessage('請先輸入名稱。', true);
+    return;
+  }
+
+  if (
+    selectedKingdomMode === 'custom' &&
+    selectedCustomKingdomIds.length !== 10
+  ) {
+    showMessage(
+      '自訂王國必須剛好選擇 10 張卡。',
+      true
+    );
+    return;
+  }
+
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .createRoom(
+          playerId,
+          playerName,
+          selectedMaxPlayers,
+          selectedKingdomMode,
+          selectedCustomKingdomIds,
+          Number(
+            document.getElementById(
+              'thinkTimeSelect'
+            ).value || 0
+          ),
+          document.getElementById(
+            'timeoutModeSelect'
+          ).value,
+          document.getElementById(
+            'countdownSoundCheckbox'
+          ).checked
+        );
+    },
+    function(result) {
+      currentRoomNumber = result.roomNumber;
+      saveRoomInformation(
+        playerName,
+        currentRoomNumber
+      );
+      showLobby();
+      startPolling();
+
+      syncAndPublishLobby_(
+        'lobby-created',
+        '房間建立成功。'
+      );
+    }
+  );
+}
+
+function showJoinPanel() {
+  document
+    .getElementById('joinPanel')
+    .classList
+    .remove('hidden');
+}
+
+function formatRoomInput(input) {
+  input.value =
+    input.value
+      .replace(/\D/g, '')
+      .slice(0, 4);
+}
+
+function joinRoomClient() {
+  const playerName = getPlayerName();
+  const roomNumber =
+    document
+      .getElementById('roomInput')
+      .value
+      .trim();
+
+  if (!playerName) {
+    showMessage('請先輸入名稱。', true);
+    return;
+  }
+
+  if (roomNumber.length !== 4) {
+    showMessage('請輸入四位數房號。', true);
+    return;
+  }
+
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .joinRoom(
+          roomNumber,
+          playerId,
+          playerName
+        );
+    },
+    function(result) {
+      currentRoomNumber =
+        String(result.roomNumber || roomNumber)
+          .padStart(4, '0');
+
+      saveRoomInformation(
+        playerName,
+        currentRoomNumber
+      );
+
+      knownRoomVersion = -1;
+      showLobby();
+      startPolling();
+
+      syncAndPublishLobby_(
+        'player-joined',
+        result.message ||
+          '成功加入房間。'
+      );
+    }
+  );
+}
+
+
+
+function syncAndPublishLobby_(
+  reason,
+  message
+) {
+  fastSyncClientState(function(state) {
+    if (
+      state &&
+      state.view === 'lobby'
+    ) {
+      publishFirebasePublicState_(
+        state,
+        reason || 'lobby-update'
+      );
+    }
+
+    if (message) {
+      showMessage(message);
+    }
+  });
+}
+
+function selectAiDifficulty(difficulty) {
+  selectedAiDifficulty = difficulty;
+
+  ['easy', 'normal', 'hard']
+    .forEach(function(value) {
+      const id =
+        'ai' +
+        value.charAt(0).toUpperCase() +
+        value.slice(1) +
+        'Button';
+
+      const button =
+        document.getElementById(id);
+
+      if (button) {
+        button.classList.toggle(
+          'selected',
+          value === difficulty
+        );
+      }
+    });
+}
+
+function addAiPlayerClient() {
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .addAiPlayer(
+          currentRoomNumber,
+          playerId,
+          selectedAiDifficulty
+        );
+    },
+    function(result) {
+      syncAndPublishLobby_(
+        'ai-player-added',
+        result.message
+      );
+    }
+  );
+}
+
+function removeAiPlayerClient(aiPlayerId) {
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .removeAiPlayer(
+          currentRoomNumber,
+          playerId,
+          aiPlayerId
+        );
+    },
+    function(result) {
+      syncAndPublishLobby_(
+        'ai-player-removed',
+        result.message
+      );
+    }
+  );
+}
+
+function scheduleAiStep(state) {
+  clearTimeout(aiStepTimer);
+
+  if (
+    !state ||
+    !state.aiStepNeeded ||
+    !state.isAiDriver ||
+    aiStepInProgress ||
+    state.gameOver
+  ) {
+    return;
+  }
+
+  aiStepTimer =
+    setTimeout(
+      runAiStepClient,
+      120
+    );
+}
+
+function runAiStepClient() {
+  if (
+    aiStepInProgress ||
+    !currentRoomNumber ||
+    !latestGameState ||
+    !latestGameState.isAiDriver
+  ) {
+    return;
+  }
+
+  aiStepInProgress = true;
+  setSyncStatus('AI 思考中', 'busy');
+
+  clearTimeout(aiWatchdogTimer);
+
+  aiWatchdogTimer =
+    setTimeout(function() {
+      if (aiStepInProgress) {
+        aiStepInProgress = false;
+        setSyncStatus('AI 重新連線', 'offline');
+        syncClientState(true);
+      }
+    }, 8000);
+
+  google.script.run
+    .withSuccessHandler(function(result) {
+      clearTimeout(aiWatchdogTimer);
+      aiStepInProgress = false;
+
+      if (
+        result &&
+        result.processed &&
+        typeof firebaseBridgePublishSignal ===
+          'function'
+      ) {
+        firebaseBridgePublishSignal(
+          'ai-step'
+        );
+      }
+
+      fastSyncClientState(function(state) {
+        publishFirebasePublicState_(
+          state,
+          'ai-step'
+        );
+      });
+    })
+    .withFailureHandler(function(error) {
+      clearTimeout(aiWatchdogTimer);
+      aiStepInProgress = false;
+
+      const message =
+        error && error.message
+          ? String(error.message)
+          : '';
+
+      if (message.indexOf('BUSY:') !== -1) {
+        setTimeout(function() {
+          fastSyncClientState();
+        }, 180);
+        return;
+      }
+
+      setSyncStatus(
+        'AI 操作失敗，重試中',
+        'offline'
+      );
+
+      console.error(error);
+
+      setTimeout(function() {
+        fastSyncClientState();
+      }, 300);
+    })
+    .processAiStep(currentRoomNumber);
+}
+
+function startGameClient() {
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .startGame(
+          currentRoomNumber,
+          playerId
+        );
+    },
+    function() {
+      fastSyncClientState(function(state) {
+        publishFirebasePublicState_(
+          state,
+          'game-started'
+        );
+
+        showMessage('遊戲開始！');
+      });
+    }
+  );
+}
+
+function leaveRoomClient() {
+  if (!currentRoomNumber) {
+    showHome();
+    return;
+  }
+
+  if (
+    latestGameState &&
+    latestGameState.status === '遊戲中'
+  ) {
+    const confirmed = window.confirm(
+      '確定要暫時離開遊戲嗎？\n\n' +
+      '牌庫與手牌會保留，可用同一瀏覽器輸入原房號返回。'
+    );
+
+    if (!confirmed) {
+      return;
+    }
+  }
+
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .leaveRoom(
+          currentRoomNumber,
+          playerId
+        );
+    },
+    function() {
+      stopPolling();
+
+      if (
+        typeof firebaseBridgeLeaveRoom ===
+          'function'
+      ) {
+        firebaseBridgeLeaveRoom();
+      }
+
+      clearTimeout(
+        actionWatchdogTimer
+      );
+
+      actionInProgress = false;
+      snapshotSyncInProgress = false;
+      currentActionTask = null;
+      pendingActions = [];
+
+      setLoading(false);
+
+      currentRoomNumber = '';
+      resetChatForRoom_();
+
+      localStorage.removeItem(
+        STORAGE_KEYS.roomNumber
+      );
+
+      showHome();
+      showMessage('已離開房間。');
+    }
+  );
+}
+
+function playActionClient(handIndex) {
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .playActionCard(
+          currentRoomNumber,
+          playerId,
+          handIndex
+        );
+    },
+    function(result) {
+      refreshGameState();
+      showMessage(result.message);
+    }
+  );
+}
+
+function buyCardClient(cardId) {
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .buySupplyCard(
+          currentRoomNumber,
+          playerId,
+          cardId
+        );
+    },
+    function(result) {
+      refreshGameState();
+      showMessage(result.message);
+    }
+  );
+}
+
+function finishCurrentPhaseClient() {
+  if (
+    !latestGameState ||
+    actionInProgress
+  ) {
+    return;
+  }
+
+  if (
+    latestGameState.interaction ||
+    interactionLockState.locked ||
+    (
+      latestGameState.effectEngine &&
+      latestGameState.effectEngine.stackDepth > 0
+    )
+  ) {
+    showMessage(
+      '請先完成目前的卡片效果。',
+      true
+    );
+    return;
+  }
+
+  const phase =
+    currentPhase === 'action'
+      ? 'action'
+      : 'buy';
+
+  applyOptimisticPhaseFinish_(phase);
+
+  publishFirebaseActionPending_(
+    phase === 'action'
+      ? 'finish-action'
+      : 'finish-buy'
+  );
+
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .finishCurrentPhaseWithState(
+          currentRoomNumber,
+          playerId,
+          phase
+        );
+    },
+    function(result) {
+      optimisticPhaseSnapshot = null;
+
+      if (result && result.state) {
+        applyServerSnapshot(result.state);
+        publishFirebasePublicState_(
+          result.state,
+          phase === 'action'
+            ? 'finish-action'
+            : 'finish-buy'
+        );
+      } else {
+        fastSyncClientState(function(state) {
+          publishFirebasePublicState_(
+            state,
+            phase === 'action'
+              ? 'finish-action'
+              : 'finish-buy'
+          );
+        });
+      }
+
+      if (
+        typeof firebaseBridgePublishSignal ===
+          'function'
+      ) {
+        firebaseBridgePublishSignal(
+          phase === 'action'
+            ? 'finish-action'
+            : 'finish-buy'
+        );
+      }
+
+      publishFirebaseActionComplete_(
+        phase === 'action'
+          ? 'finish-action'
+          : 'finish-buy',
+        result && result.state
+      );
+
+      showMessage(
+        result.message || '階段已完成'
+      );
+    }
+  );
+}
+
+function applyOptimisticPhaseFinish_(phase) {
+  optimisticPhaseSnapshot =
+    latestGameState
+      ? JSON.parse(
+          JSON.stringify(latestGameState)
+        )
+      : null;
+
+  const button =
+    document.getElementById(
+      'finishPhaseButton'
+    );
+
+  const status =
+    document.getElementById(
+      'turnStatus'
+    );
+
+  if (button) {
+    button.disabled = true;
+    button.textContent =
+      phase === 'action'
+        ? '已完成行動'
+        : '已完成購買';
+  }
+
+  if (status) {
+    status.textContent =
+      phase === 'action'
+        ? '已送出，正在切換下一位玩家…'
+        : '已送出，等待其他玩家完成購買…';
+  }
+
+  setSyncStatus(
+    'Firebase 即時確認中',
+    'busy'
+  );
+}
+
+function rollbackOptimisticPhase_() {
+  if (!optimisticPhaseSnapshot) {
+    return;
+  }
+
+  const snapshot = optimisticPhaseSnapshot;
+  optimisticPhaseSnapshot = null;
+  applyServerSnapshot(snapshot);
+}
+
+function respondMoatClient(revealMoat) {
+  if (interactionLockState.locked) {
+    return;
+  }
+
+  lockInteraction_(
+    revealMoat
+      ? 'moat-reveal'
+      : 'moat-decline'
+  );
+
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .respondToAttackReaction(
+          currentRoomNumber,
+          playerId,
+          revealMoat
+        );
+    },
+    function(result) {
+      selectedIndexes = [];
+
+      unlockInteraction_(
+        'moat-server-confirmed'
+      );
+
+      if (result && result.state) {
+        applyServerSnapshot(
+          result.state
+        );
+
+        publishFirebasePublicState_(
+          result.state,
+          revealMoat
+            ? 'moat-revealed'
+            : 'moat-declined'
+        );
+
+        if (
+          result.state.interaction &&
+          typeof firebaseBridgePublishEvent ===
+            'function'
+        ) {
+          firebaseBridgePublishEvent(
+            'private-interaction-ready',
+            {
+              playerId:
+                result.state.interaction
+                  .playerId || '',
+              interactionId:
+                result.state.interaction
+                  .interactionId || '',
+              version:
+                Number(
+                  result.state.version || 0
+                )
+            }
+          );
+        }
+      } else {
+        fastSyncClientState();
+      }
+
+      showMessage(result.message);
+    }
+  );
+}
+
+
+
+function cancelInteractionClient() {
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .cancelCurrentInteraction(
+          currentRoomNumber,
+          playerId
+        );
+    },
+    function(result) {
+      selectedIndexes = [];
+      syncClientState(true);
+      showMessage(
+        result.message ||
+        '已放棄卡片效果'
+      );
+    }
+  );
+}
+
+function submitSpyDecisionClient(action) {
+  markSpecialChoicePending_();
+
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .submitSpecialInteractionChoice(
+          currentRoomNumber,
+          playerId,
+          {action:action}
+        );
+    },
+    function(result) {
+      fastSyncClientState();
+      showMessage(result.message);
+    }
+  );
+}
+
+function submitThiefDecisionClient(cardId) {
+  markSpecialChoicePending_();
+
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .submitSpecialInteractionChoice(
+          currentRoomNumber,
+          playerId,
+          {cardId:cardId}
+        );
+    },
+    function(result) {
+      fastSyncClientState();
+      showMessage(result.message);
+    }
+  );
+}
+
+
+function applyEngineActionResult_(
+  result,
+  reason
+) {
+  if (result && result.state) {
+    applyServerSnapshot(
+      result.state
+    );
+
+    publishFirebasePublicState_(
+      result.state,
+      reason || 'engine-action'
+    );
+
+    if (
+      result.state.interaction &&
+      typeof firebaseBridgePublishEvent ===
+        'function'
+    ) {
+      firebaseBridgePublishEvent(
+        'private-interaction-ready',
+        {
+          playerId:
+            result.state.interaction
+              .playerId || '',
+          interactionId:
+            result.state.interaction
+              .interactionId || '',
+          version:
+            Number(
+              result.state.version || 0
+            )
+        }
+      );
+    }
+
+    return;
+  }
+
+  fastSyncClientState();
+}
+
+function submitHandChoiceClient() {
+  const interaction =
+    latestGameState &&
+    latestGameState.interaction;
+
+  if (!interaction) return;
+
+  const isMilitia =
+    interaction.type === 'discard';
+
+  const methodName =
+    isMilitia
+      ? 'submitAttackDiscardChoice'
+      : 'submitSelectionChoice';
+
+  const payload =
+    isMilitia
+      ? selectedIndexes
+      : {handIndexes:selectedIndexes};
+
+  if (interactionLockState.locked) {
+    return;
+  }
+
+  lockInteraction_(
+    interaction.mode === 'repeatAction'
+      ? 'throne-room-selection'
+      : 'hand-selection'
+  );
+
+  runActionWithRetry_(
+    function(success, failure) {
+      const runner =
+        google.script.run
+          .withSuccessHandler(success)
+          .withFailureHandler(failure);
+
+      runner[methodName](
+        currentRoomNumber,
+        playerId,
+        payload
+      );
+    },
+    function(result) {
+      selectedIndexes = [];
+
+      unlockInteraction_(
+        'selection-server-confirmed'
+      );
+
+      if (result && result.state) {
+        applyServerSnapshot(
+          result.state
+        );
+
+        publishFirebasePublicState_(
+          result.state,
+          'selection-complete'
+        );
+
+        if (
+          result.state.interaction &&
+          typeof firebaseBridgePublishEvent ===
+            'function'
+        ) {
+          firebaseBridgePublishEvent(
+            'private-interaction-ready',
+            {
+              playerId:
+                result.state.interaction
+                  .playerId || '',
+              interactionId:
+                result.state.interaction
+                  .interactionId || '',
+              version:
+                Number(
+                  result.state.version || 0
+                )
+            }
+          );
+        }
+      } else {
+        fastSyncClientState();
+      }
+
+      showMessage(result.message);
+    }
+  );
+}
+
+function selectSupplyChoiceClient(cardId) {
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .submitSelectionChoice(
+          currentRoomNumber,
+          playerId,
+          {cardId:cardId}
+        );
+    },
+    function(result) {
+      applyEngineActionResult_(
+        result,
+        'supply-selection'
+      );
+      showMessage(result.message);
+    }
+  );
+}
+
+
+
+function setSyncStatus(text, mode) {
+  const element =
+    document.getElementById('syncStatus');
+
+  if (!element) return;
+
+  element.textContent = text;
+  element.className =
+    'sync-status' +
+    (mode ? ' ' + mode : '');
+}
+
+/**
+ * V15.2 唯一同步入口。
+ *
+ * 不再分別呼叫 getRoomState / getGameState。
+ * 不再用 version 決定是否保留舊畫面。
+ * 每次都以 Server Snapshot 完整覆蓋目前畫面。
+ */
+function syncClientState(force) {
+  if (
+    !currentRoomNumber ||
+    actionInProgress ||
+    snapshotSyncInProgress
+  ) {
+    return false;
+  }
+
+  snapshotSyncInProgress = true;
+
+  const requestSerial =
+    ++syncRequestSerial;
+
+  clearTimeout(syncWatchdogTimer);
+
+  if (force) {
+    setSyncStatus('更新中', 'busy');
+  }
+
+  syncWatchdogTimer =
+    setTimeout(function() {
+      if (
+        snapshotSyncInProgress &&
+        requestSerial === syncRequestSerial
+      ) {
+        snapshotSyncInProgress = false;
+        setSyncStatus('重新連線中', 'offline');
+
+        setTimeout(function() {
+          syncClientState(true);
+        }, 700);
+      }
+    }, 8000);
+
+  /*
+   * V18.3：
+   * 任何仍在線的玩家同步時，都先請伺服器處理：
+   * - 已超時的離線玩家
+   * - AI 接管
+   * - 連續 AI 操作
+   *
+   * 完成後再取得最新房間快照。
+   */
+  google.script.run
+    .withSuccessHandler(function(advanceResult) {
+      if (
+        advanceResult &&
+        advanceResult.processed &&
+        typeof firebaseBridgePublishSignal ===
+          'function'
+      ) {
+        firebaseBridgePublishSignal(
+          'server-advance'
+        );
+      }
+
+      google.script.run
+        .withSuccessHandler(function(state) {
+          if (
+            requestSerial !==
+            syncRequestSerial
+          ) {
+            return;
+          }
+
+          clearTimeout(
+            syncWatchdogTimer
+          );
+
+          snapshotSyncInProgress =
+            false;
+
+          applyServerSnapshot(state);
+
+          if (
+            state &&
+            state.performance &&
+            typeof firebaseBridgeSetServerPerformance ===
+              'function'
+          ) {
+            firebaseBridgeSetServerPerformance(
+              state.performance
+            );
+          }
+        })
+        .withFailureHandler(
+          handleSnapshotSyncFailure_
+        )
+        .getClientState(
+          currentRoomNumber,
+          playerId
+        );
+    })
+    .withFailureHandler(
+      handleSnapshotSyncFailure_
+    )
+    .advanceRoomServerSide(
+      currentRoomNumber,
+      playerId
+    );
+
+  function handleSnapshotSyncFailure_(
+    error
+  ) {
+    if (
+      requestSerial !==
+      syncRequestSerial
+    ) {
+      return;
+    }
+
+    clearTimeout(syncWatchdogTimer);
+    snapshotSyncInProgress = false;
+    setSyncStatus(
+      '連線異常',
+      'offline'
+    );
+
+    console.error(
+      '同步失敗：',
+      error
+    );
+
+    setTimeout(function() {
+      syncClientState(true);
+    }, 900);
+  }
+}
+
+
+function fastSyncClientState(onComplete) {
+  if (
+    !currentRoomNumber ||
+    snapshotSyncInProgress
+  ) {
+    return;
+  }
+
+  snapshotSyncInProgress = true;
+
+  const requestSerial =
+    ++syncRequestSerial;
+
+  clearTimeout(
+    syncWatchdogTimer
+  );
+
+  syncWatchdogTimer =
+    setTimeout(function() {
+      if (
+        snapshotSyncInProgress &&
+        requestSerial ===
+          syncRequestSerial
+      ) {
+        snapshotSyncInProgress = false;
+        setSyncStatus(
+          '重新連線中',
+          'offline'
+        );
+
+        setTimeout(function() {
+          syncClientState(true);
+        }, 350);
+      }
+    }, 7000);
+
+  /*
+   * 玩家剛完成操作時，房間資料已經由該操作寫回。
+   * 直接讀取最新快照，不再多跑一次
+   * advanceRoomServerSide。
+   */
+  google.script.run
+    .withSuccessHandler(function(state) {
+      if (
+        requestSerial !==
+        syncRequestSerial
+      ) {
+        return;
+      }
+
+      clearTimeout(
+        syncWatchdogTimer
+      );
+
+      snapshotSyncInProgress = false;
+      applyServerSnapshot(state);
+
+      if (
+        state &&
+        state.performance &&
+        typeof firebaseBridgeSetServerPerformance ===
+          'function'
+      ) {
+        firebaseBridgeSetServerPerformance(
+          state.performance
+        );
+      }
+
+      if (
+        typeof onComplete ===
+          'function'
+      ) {
+        onComplete(state);
+      }
+    })
+    .withFailureHandler(function(error) {
+      if (
+        requestSerial !==
+        syncRequestSerial
+      ) {
+        return;
+      }
+
+      clearTimeout(
+        syncWatchdogTimer
+      );
+
+      snapshotSyncInProgress = false;
+
+      console.error(
+        '快速同步失敗：',
+        error
+      );
+
+      setTimeout(function() {
+        syncClientState(true);
+      }, 350);
+    })
+    .getClientState(
+      currentRoomNumber,
+      playerId
+    );
+  return true;
+}
+
+
+
+function publishFirebaseActionPending_(
+  actionType,
+  details
+) {
+  firebaseActionPending = {
+    type:actionType,
+    playerId:playerId,
+    createdAt:Date.now()
+  };
+
+  if (
+    typeof firebaseBridgePublishEvent ===
+      'function'
+  ) {
+    firebaseBridgePublishEvent(
+      'action-pending',
+      {
+        actionType:actionType,
+        playerId:playerId,
+        details:details || {}
+      }
+    );
+  }
+}
+
+function publishFirebaseActionComplete_(
+  actionType,
+  state
+) {
+  firebaseActionPending = null;
+
+  if (
+    typeof firebaseBridgePublishEvent ===
+      'function'
+  ) {
+    firebaseBridgePublishEvent(
+      'action-complete',
+      {
+        actionType:actionType,
+        playerId:playerId,
+        version:
+          Number(
+            state && state.version || 0
+          )
+      }
+    );
+  }
+}
+
+function handleFirebaseRoomEvent(
+  event,
+  eventKey
+) {
+  if (!event) return;
+
+  firebaseEventCount += 1;
+  firebaseLastEventAt = Date.now();
+
+  const payload =
+    event.payload || {};
+
+  if (
+    event.type === 'action-pending' &&
+    event.actorId !== playerId
+  ) {
+    const actor =
+      (latestGameState.players || [])
+        .find(function(item) {
+          return item.id ===
+            event.actorId;
+        });
+
+    setSyncStatus(
+      (
+        actor
+          ? actor.name
+          : '其他玩家'
+      ) +
+        ' 正在操作…',
+      'busy'
+    );
+  }
+
+  if (
+    event.type === 'action-complete'
+  ) {
+    setSyncStatus(
+      'Firebase 即時確認',
+      'live'
+    );
+  }
+
+  if (
+    event.type === 'ai-control-changed'
+  ) {
+    setTimeout(function() {
+      fastSyncClientState();
+    }, 30);
+  }
+
+  if (
+    event.type === 'private-interaction-ready' &&
+    payload.playerId === playerId
+  ) {
+    setTimeout(function() {
+      fastSyncClientState();
+    }, 20);
+  }
+
+  if (
+    event.type === 'lobby-changed'
+  ) {
+    setTimeout(function() {
+      fastSyncClientState();
+    }, 30);
+  }
+}
+
+function maybeRunAiFromFirebase_(
+  state
+) {
+  if (
+    !state ||
+    !state.aiStepNeeded ||
+    !state.isAiDriver ||
+    aiStepInProgress
+  ) {
+    return;
+  }
+
+  setTimeout(function() {
+    maybeRunAiStep();
+  }, 20);
+}
+
+function buildFirebasePublicState_(
+  state
+) {
+  if (
+    !state ||
+    !state.success ||
+    (
+      state.view !== 'game' &&
+      state.view !== 'lobby'
+    )
+  ) {
+    return null;
+  }
+
+  if (state.view === 'lobby') {
+    return {
+      success:true,
+      roomExists:true,
+      view:'lobby',
+      roomNumber:state.roomNumber,
+      version:Number(state.version || 0),
+      status:state.status,
+      maxPlayers:Number(state.maxPlayers || 0),
+      playerCount:Number(state.playerCount || 0),
+      players:
+        (state.players || []).map(
+          function(player) {
+            return {
+              id:player.id,
+              name:player.name,
+              seat:player.seat,
+              isHost:Boolean(player.isHost),
+              isAi:Boolean(player.isAi),
+              aiDifficulty:
+                player.aiDifficulty || '',
+              connected:
+                player.connected !== false
+            };
+          }
+        ),
+      kingdomMode:
+        state.kingdomMode || 'balanced',
+      kingdomCardIds:
+        Array.isArray(state.kingdomCardIds)
+          ? state.kingdomCardIds.slice()
+          : [],
+      cardCatalog:
+        Object.assign(
+          {},
+          state.cardCatalog || {}
+        ),
+      timerRules:
+        state.timerRules
+          ? JSON.parse(
+              JSON.stringify(
+                state.timerRules
+              )
+            )
+          : null
+    };
+  }
+
+  return {
+    success:true,
+    roomExists:true,
+    view:'game',
+    roomNumber:state.roomNumber,
+    version:Number(state.version || 0),
+    status:state.status,
+    phase:state.phase,
+    roundNumber:state.roundNumber,
+    gameOver:Boolean(state.gameOver),
+    activeActionPlayerId:
+      state.activeActionPlayerId || '',
+    activeActionPlayerName:
+      state.activeActionPlayerName || '',
+    emptyPileLimit:
+      Number(state.emptyPileLimit || 3),
+    serverAdvancePaused:
+      Boolean(state.serverAdvancePaused),
+    players:
+      (state.players || []).map(
+        function(player) {
+          return {
+            id:player.id,
+            name:player.name,
+            seat:player.seat,
+            isHost:Boolean(player.isHost),
+            isAi:Boolean(player.isAi),
+            aiDifficulty:
+              player.aiDifficulty || '',
+            aiControlled:
+              Boolean(player.aiControlled),
+            manualAiControl:
+              Boolean(
+                player.manualAiControl
+              ),
+            connected:
+              player.connected !== false,
+            handCount:
+              Number(player.handCount || 0),
+            deckCount:
+              Number(player.deckCount || 0),
+            discardCount:
+              Number(
+                player.discardCount || 0
+              ),
+            actionFinished:
+              Boolean(
+                player.actionFinished
+              ),
+            buyFinished:
+              Boolean(
+                player.buyFinished
+              )
+          };
+        }
+      ),
+    supply:
+      Object.assign({}, state.supply || {}),
+    trash:
+      Array.isArray(state.trash)
+        ? state.trash.slice()
+        : [],
+    log:
+      Array.isArray(state.log)
+        ? state.log.slice(-80)
+        : [],
+    interaction:
+      state.interaction
+        ? {
+            type:state.interaction.type,
+            interactionId:
+              state.interaction.interactionId || '',
+            sequence:
+              Number(
+                state.interaction.sequence || 0
+              ),
+            playerId:
+              state.interaction.playerId,
+            sourceCardId:
+              state.interaction.sourceCardId || '',
+            targetPlayerName:
+              state.interaction.targetPlayerName || ''
+          }
+        : null,
+    timer:
+      state.timer
+        ? JSON.parse(
+            JSON.stringify(state.timer)
+          )
+        : null
+  };
+}
+
+function publishFirebasePublicState_(
+  state,
+  reason
+) {
+  if (
+    typeof firebaseBridgePublishRoomState !==
+      'function'
+  ) {
+    return;
+  }
+
+  const publicState =
+    buildFirebasePublicState_(state);
+
+  if (publicState) {
+    firebaseBridgePublishRoomState(
+      publicState,
+      reason || 'state-update'
+    );
+
+    if (
+      publicState.view === 'lobby' &&
+      typeof firebaseBridgePublishEvent ===
+        'function'
+    ) {
+      firebaseBridgePublishEvent(
+        'lobby-changed',
+        {
+          version:
+            Number(
+              publicState.version || 0
+            ),
+          playerCount:
+            Number(
+              publicState.playerCount || 0
+            ),
+          maxPlayers:
+            Number(
+              publicState.maxPlayers || 0
+            ),
+          reason:
+            String(
+              reason || 'lobby-update'
+            )
+        }
+      );
+    }
+  }
+}
+
+function applyFirebaseRoomSnapshot(
+  publicState,
+  metadata
+) {
+  if (
+    !publicState ||
+    publicState.roomNumber !==
+      currentRoomNumber
+  ) {
+    return;
+  }
+
+  /*
+   * V23.0.1：等待室也由 Firebase 即時更新。
+   * 等待室沒有 latestGameState，因此必須在遊戲狀態合併前
+   * 先獨立處理 lobby snapshot。
+   */
+  if (publicState.view === 'lobby') {
+    const incomingVersion =
+      Number(publicState.version || 0);
+
+    if (
+      incomingVersion > 0 &&
+      incomingVersion <
+        Number(knownRoomVersion || 0)
+    ) {
+      return;
+    }
+
+    knownRoomVersion =
+      incomingVersion ||
+      knownRoomVersion;
+
+    const ownPlayer =
+      (publicState.players || [])
+        .find(function(item) {
+          return item.id === playerId;
+        });
+
+    const lobbyState =
+      Object.assign(
+        {},
+        publicState,
+        {
+          playerRole:
+            ownPlayer &&
+            ownPlayer.isHost
+              ? 'host'
+              : 'player',
+          canStart:
+            Boolean(
+              ownPlayer &&
+              ownPlayer.isHost &&
+              Number(
+                publicState.playerCount || 0
+              ) ===
+                Number(
+                  publicState.maxPlayers || 0
+                )
+            )
+        }
+      );
+
+    latestGameState = null;
+    cardCatalog =
+      lobbyState.cardCatalog || {};
+
+    showLobby();
+    renderLobbySnapshot(
+      lobbyState
+    );
+
+    setSyncStatus(
+      'Firebase 等待室即時更新',
+      'live'
+    );
+
+    if (
+      typeof firebaseBridgeAddDebugEvent ===
+        'function'
+    ) {
+      firebaseBridgeAddDebugEvent(
+        '已套用等待室狀態 v' +
+          knownRoomVersion +
+          '｜' +
+          lobbyState.playerCount +
+          '/' +
+          lobbyState.maxPlayers,
+        'success'
+      );
+    }
+
+    return;
+  }
+
+  if (!latestGameState) {
+    /*
+     * 從等待室切換到遊戲時，先取得一次完整私人快照。
+     */
+    fastSyncClientState();
+    return;
+  }
+
+  const incomingVersion =
+    Number(publicState.version || 0);
+
+  if (
+    incomingVersion > 0 &&
+    incomingVersion <
+      Number(knownRoomVersion || 0)
+  ) {
+    return;
+  }
+
+  const merged =
+    JSON.parse(
+      JSON.stringify(
+        latestGameState
+      )
+    );
+
+  [
+    'status',
+    'phase',
+    'roundNumber',
+    'gameOver',
+    'activeActionPlayerId',
+    'activeActionPlayerName',
+    'emptyPileLimit',
+    'serverAdvancePaused',
+    'timer'
+  ].forEach(function(key) {
+    if (
+      Object.prototype.hasOwnProperty.call(
+        publicState,
+        key
+      )
+    ) {
+      merged[key] =
+        publicState[key];
+    }
+  });
+
+  /*
+   * V22.1.1：
+   * Firebase 的 interaction 只有公開摘要，
+   * 不含小偷 treasureOptions、trashedCardId、
+   * 間諜 revealedCardId 等私人操作資料。
+   *
+   * 若目前觀看者就是互動玩家，而且本機已經有
+   * 完整私人 interaction，就不可被公開摘要覆蓋。
+   */
+  const existingInteraction =
+    latestGameState.interaction;
+
+  const publicInteraction =
+    publicState.interaction;
+
+  const viewerOwnsExistingInteraction =
+    Boolean(
+      existingInteraction &&
+      existingInteraction.playerId ===
+        playerId
+    );
+
+  const sameInteraction =
+    Boolean(
+      existingInteraction &&
+      publicInteraction &&
+      (
+        (
+          existingInteraction.interactionId &&
+          publicInteraction.interactionId &&
+          existingInteraction.interactionId ===
+            publicInteraction.interactionId
+        ) ||
+        (
+          !existingInteraction.interactionId &&
+          existingInteraction.type ===
+            publicInteraction.type &&
+          existingInteraction.playerId ===
+            publicInteraction.playerId
+        )
+      )
+    );
+
+  if (
+    viewerOwnsExistingInteraction &&
+    sameInteraction
+  ) {
+    merged.interaction =
+      JSON.parse(
+        JSON.stringify(
+          existingInteraction
+        )
+      );
+  } else {
+    merged.interaction =
+      publicInteraction
+        ? JSON.parse(
+            JSON.stringify(
+              publicInteraction
+            )
+          )
+        : null;
+  }
+
+  merged.version =
+    incomingVersion ||
+    merged.version;
+
+  merged.players =
+    Array.isArray(publicState.players)
+      ? publicState.players.map(
+          function(publicPlayer) {
+            const existing =
+              (latestGameState.players || [])
+                .find(function(item) {
+                  return (
+                    item.id ===
+                    publicPlayer.id
+                  );
+                }) || {};
+
+            return Object.assign(
+              {},
+              existing,
+              publicPlayer
+            );
+          }
+        )
+      : merged.players;
+
+  merged.supply =
+    Object.assign(
+      {},
+      publicState.supply || merged.supply
+    );
+
+  merged.trash =
+    Array.isArray(publicState.trash)
+      ? publicState.trash.slice()
+      : merged.trash;
+
+  merged.log =
+    Array.isArray(publicState.log)
+      ? publicState.log.slice()
+      : merged.log;
+
+  const ownPublic =
+    (merged.players || [])
+      .find(function(item) {
+        return item.id === playerId;
+      });
+
+  if (ownPublic && merged.player) {
+    merged.player.deckCount =
+      ownPublic.deckCount;
+    merged.player.discardCount =
+      ownPublic.discardCount;
+  }
+
+  merged.isActionPlayer =
+    merged.phase === 'action' &&
+    merged.activeActionPlayerId ===
+      playerId;
+
+  merged.buyFinished =
+    ownPublic
+      ? Boolean(ownPublic.buyFinished)
+      : Boolean(merged.buyFinished);
+
+  merged.canBuy =
+    merged.phase === 'buy' &&
+    !merged.buyFinished &&
+    !merged.interaction;
+
+  merged.isInteractionPlayer =
+    Boolean(
+      merged.interaction &&
+      merged.interaction.playerId ===
+        playerId
+    );
+
+  knownRoomVersion =
+    Number(merged.version || 0);
+
+  latestGameState = merged;
+  renderGameState(merged);
+  maybeRunAiFromFirebase_(merged);
+
+  const viewerNeedsPrivateInteraction =
+    Boolean(
+      merged.interaction &&
+      merged.interaction.playerId ===
+        playerId &&
+      (
+        (
+          merged.interaction.type === 'thiefTrashDecision' &&
+          !Array.isArray(
+            merged.interaction
+              .treasureOptions
+          )
+        ) ||
+        (
+          merged.interaction.type === 'thiefGainDecision' &&
+          !merged.interaction
+            .trashedCardId
+        ) ||
+        (
+          merged.interaction.type === 'spyDecision' &&
+          !merged.interaction
+            .revealedCardId
+        ) ||
+        (
+          merged.interaction.type === 'libraryDecision' &&
+          !merged.interaction
+            .revealedCardId
+        )
+      )
+    );
+
+  if (viewerNeedsPrivateInteraction) {
+    clearTimeout(
+      firebasePrivateReconcileTimer
+    );
+
+    firebasePrivateReconcileTimer =
+      setTimeout(function() {
+        fastSyncClientState();
+      }, 20);
+  }
+
+  setSyncStatus(
+    'Firebase 即時畫面',
+    'live'
+  );
+
+  if (
+    typeof firebaseBridgeAddDebugEvent ===
+      'function'
+  ) {
+    firebaseBridgeAddDebugEvent(
+      '已直接套用 Firebase 公開狀態 v' +
+        knownRoomVersion,
+      'success'
+    );
+  }
+
+  /*
+   * 公開狀態不包含手牌、牌庫內容及完整互動選項。
+   * 延後做一次私人快照校正；畫面切換不必等待它。
+   */
+  if (!viewerNeedsPrivateInteraction) {
+    clearTimeout(
+      firebasePrivateReconcileTimer
+    );
+
+    firebasePrivateReconcileTimer =
+      setTimeout(function() {
+        fastSyncClientState();
+      }, 1800);
+  }
+}
+
+function applyServerSnapshot(state) {
+  if (
+    shouldUnlockForSnapshot_(state)
+  ) {
+    unlockInteraction_(
+      'snapshot-advanced'
+    );
+  }
+
+  if (
+    !state ||
+    !state.success ||
+    !state.roomExists
+  ) {
+    stopPolling();
+    currentRoomNumber = '';
+
+    localStorage.removeItem(
+      STORAGE_KEYS.roomNumber
+    );
+
+    showHome();
+
+    showMessage(
+      state && state.message
+        ? state.message
+        : '房間不存在。',
+      true
+    );
+
+    return;
+  }
+
+  knownRoomVersion =
+    Number(state.version || 0);
+
+  if (
+    typeof firebaseBridgeBindRoom ===
+      'function'
+  ) {
+    firebaseBridgeBindRoom(
+      currentRoomNumber,
+      playerId
+    );
+  }
+
+  setSyncStatus(
+    window.firebaseBridgeReady
+      ? 'Firebase 即時連線'
+      : '已同步',
+    'live'
+  );
+
+  if (state.view === 'lobby') {
+    latestGameState = null;
+    cardCatalog = {};
+
+    showLobby();
+    renderLobbySnapshot(state);
+    return;
+  }
+
+  if (state.view === 'game') {
+    /*
+     * 若玩家直接重新整理或用原網址回來，
+     * 不一定會重新呼叫 joinRoom。
+     * 偵測自己仍被 AI 接管時，自動恢復真人控制。
+     */
+    if (
+      state.player &&
+      !state.player.isAi &&
+      state.player.aiControlled &&
+      !state.player.manualAiControl &&
+      !reconnectReclaimRequested
+    ) {
+      reconnectReclaimRequested = true;
+
+      google.script.run
+        .withSuccessHandler(function() {
+          reconnectReclaimRequested =
+            false;
+
+          setTimeout(function() {
+            syncClientState(true);
+          }, 150);
+        })
+        .withFailureHandler(function(error) {
+          reconnectReclaimRequested =
+            false;
+
+          console.error(
+            '自動恢復真人控制失敗：',
+            error
+          );
+        })
+        .reconnectAndReclaimControl(
+          currentRoomNumber,
+          playerId
+        );
+    }
+
+    /*
+     * 完整取代舊狀態。
+     * 深層複製可避免 UI 選擇狀態意外修改伺服器快照。
+     */
+    latestGameState =
+      JSON.parse(JSON.stringify(state));
+
+    cardCatalog =
+      state.cardCatalog || {};
+
+    showGame();
+    renderGameState(state);
+    return;
+  }
+
+  showHome();
+}
+
+function renderLobbySnapshot(state) {
+  latestLobbyPlayerRole =
+    state.playerRole || '';
+
+  document.getElementById(
+    'roomNumberText'
+  ).textContent = state.roomNumber;
+
+  document.getElementById(
+    'roomStatus'
+  ).textContent =
+    '等待玩家：' +
+    state.playerCount +
+    ' / ' +
+    state.maxPlayers;
+
+  /*
+   * 先清空，再完全依伺服器 players 重建。
+   */
+  renderLobbyPlayers({
+    players:(state.players || []).slice(),
+    maxPlayers:state.maxPlayers
+  });
+
+  renderLobbyKingdom(state);
+  renderLobbyTimerRules(state);
+
+  const aiControls =
+    document.getElementById(
+      'aiLobbyControls'
+    );
+
+  const startButton =
+    document.getElementById('startButton');
+
+  if (state.playerRole === 'host') {
+    startButton.classList.remove('hidden');
+    startButton.disabled =
+      !state.canStart;
+
+    if (aiControls) {
+      aiControls.classList.remove('hidden');
+    }
+  } else {
+    startButton.classList.add('hidden');
+
+    if (aiControls) {
+      aiControls.classList.add('hidden');
+    }
+  }
+
+  const addAiButton =
+    document.getElementById('addAiButton');
+
+  if (addAiButton) {
+    addAiButton.disabled =
+      state.playerCount >=
+      state.maxPlayers;
+  }
+}
+
+/*
+ * 保留舊函式名稱，讓既有操作完成後可以直接呼叫，
+ * 但實際都走同一個 Snapshot API。
+ */
+
+
+function renderLobbyTimerRules(state) {
+  const rules =
+    state.timerRules || {};
+
+  const seconds =
+    Number(
+      rules.thinkTimeSeconds || 0
+    );
+
+  const timeNames = {
+    0:'不限制',
+    30:'30 秒',
+    60:'1 分鐘',
+    180:'3 分鐘',
+    300:'5 分鐘',
+    600:'10 分鐘'
+  };
+
+  const timeoutNames = {
+    ai:'AI 接管',
+    finish:'自動完成階段',
+    skip:'自動略過互動'
+  };
+
+  const timeElement =
+    document.getElementById(
+      'lobbyTimerRule'
+    );
+
+  const timeoutElement =
+    document.getElementById(
+      'lobbyTimeoutRule'
+    );
+
+  if (timeElement) {
+    timeElement.textContent =
+      '思考時間：' +
+      (timeNames[seconds] || seconds + ' 秒');
+  }
+
+  if (timeoutElement) {
+    timeoutElement.textContent =
+      '時間到：' +
+      (
+        timeoutNames[rules.timeoutMode] ||
+        'AI 接管'
+      );
+  }
+}
+
+function renderLobbyKingdom(state) {
+  const modeNames = {
+    balanced:'均衡隨機',
+    random:'完全隨機',
+    beginner:'新手模式',
+    attack:'攻擊模式',
+    engine:'引擎模式',
+    money:'大錢流',
+    custom:'自訂 10 張',
+    all:'全部卡片'
+  };
+
+  const title =
+    document.getElementById(
+      'lobbyKingdomMode'
+    );
+
+  const container =
+    document.getElementById(
+      'lobbyKingdomCards'
+    );
+
+  if (title) {
+    title.textContent =
+      '王國卡：' +
+      (
+        modeNames[state.kingdomMode] ||
+        state.kingdomMode
+      );
+  }
+
+  if (!container) return;
+
+  const catalog =
+    state.cardCatalog || {};
+
+  container.innerHTML =
+    (state.kingdomCardIds || [])
+      .map(function(cardId) {
+        const card = catalog[cardId];
+
+        return (
+          '<span class="kingdom-chip">' +
+          escapeHtml(
+            card ? card.name : cardId
+          ) +
+          '</span>'
+        );
+      })
+      .join('');
+}
+
+function refreshRoomState() {
+  fastSyncClientState();
+}
+
+function refreshGameState() {
+  fastSyncClientState();
+}
+
+function renderLobbyPlayers(state) {
+  const container =
+    document.getElementById('lobbyPlayers');
+
+  container.innerHTML = '';
+
+  for (
+    let seat = 1;
+    seat <= state.maxPlayers;
+    seat++
+  ) {
+    const player = state.players[seat - 1];
+    const row = document.createElement('div');
+
+    row.className =
+      'lobby-player' +
+      (player ? '' : ' empty-seat');
+
+    row.innerHTML =
+      '<div class="seat-badge">' +
+      seat +
+      '</div><div><strong>' +
+      escapeHtml(
+        player
+          ? player.name
+          : '等待玩家加入'
+      ) +
+      '</strong>' +
+      (
+        player && player.isHost
+          ? '<small>房主</small>'
+          : ''
+      ) +
+      (
+        player && player.isAi
+          ? '<span class="ai-player-tag">AI</span>'
+          : ''
+      ) +
+      (
+        player && player.connected === false
+          ? '<small class="offline-text">離線</small>'
+          : ''
+      ) +
+      '</div>';
+
+    if (
+      player &&
+      player.isAi &&
+      latestLobbyPlayerRole === 'host'
+    ) {
+      const removeButton =
+        document.createElement('button');
+
+      removeButton.type = 'button';
+      removeButton.className =
+        'ai-remove-button';
+      removeButton.textContent = '移除';
+
+      removeButton.onclick = function() {
+        removeAiPlayerClient(player.id);
+      };
+
+      row.appendChild(removeButton);
+    }
+
+    container.appendChild(row);
+  }
+}
+
+function renderGameState(state) {
+  if (!state || !state.success) return;
+
+  renderEffectStackInspector_(
+    state.effectEngine
+  );
+
+  renderAttackEngineInspector_(
+    state.attackEngine
+  );
+
+  renderRoomHealthInspector_(
+    state.roomHealth
+  );
+
+  renderSafeCompleteInspector_(
+    state.safeComplete
+  );
+
+  renderAiEngineInspector_(
+    state.aiEngine
+  );
+
+  renderAiActionEngineInspector_(
+    state.aiEngine
+  );
+
+  /*
+   * V15.2：完整覆蓋，不沿用舊 players / supply / log。
+   */
+  latestGameState =
+    JSON.parse(JSON.stringify(state));
+
+  knownRoomVersion =
+    Number(state.version || 0);
+
+  setSyncStatus('已同步', 'live');
+
+  currentPhase = state.phase;
+
+  cardCatalog =
+    state.cardCatalog || {};
+
+  document.getElementById(
+    'gameRoomNumber'
+  ).textContent = state.roomNumber;
+
+  document.getElementById(
+    'roundNumberText'
+  ).textContent =
+    '第 ' + state.roundNumber + ' 回合';
+
+  document.getElementById(
+    'phaseText'
+  ).textContent =
+    state.phase === 'action'
+      ? '行動階段'
+      : state.phase === 'buy'
+        ? '同時購買階段'
+        : '遊戲結束';
+
+  document.getElementById(
+    'activePlayerText'
+  ).textContent =
+    state.phase === 'action'
+      ? state.activeActionPlayerName
+      : '所有尚未完成購買的玩家';
+
+  document.getElementById(
+    'actionsText'
+  ).textContent = state.player.actions;
+
+  document.getElementById(
+    'buysText'
+  ).textContent = state.player.buys;
+
+  document.getElementById(
+    'coinsText'
+  ).textContent = state.player.coins;
+
+  document.getElementById(
+    'ownDeckCount'
+  ).textContent = state.player.deckCount;
+
+  document.getElementById(
+    'ownDiscardCount'
+  ).textContent =
+    state.player.discardCount;
+
+  const finishButton =
+    document.getElementById(
+      'finishPhaseButton'
+    );
+
+  const turnStatus =
+    document.getElementById('turnStatus');
+
+  if (state.gameOver) {
+    finishButton.disabled = true;
+    turnStatus.textContent = '遊戲已結束';
+  } else if (state.interaction) {
+    finishButton.disabled = true;
+    turnStatus.textContent =
+      state.isInteractionPlayer
+        ? '請處理卡片效果'
+        : '等待其他玩家處理卡片效果';
+  } else if (state.phase === 'action') {
+    finishButton.textContent = '完成行動';
+    finishButton.disabled =
+      !state.canFinishAction ||
+      actionInProgress ||
+      interactionLockState.locked;
+
+    turnStatus.textContent =
+      state.isActionPlayer
+        ? '現在輪到你行動'
+        : '等待 ' +
+          state.activeActionPlayerName +
+          ' 行動';
+  } else {
+    finishButton.textContent =
+      state.buyFinished
+        ? '已完成購買'
+        : '完成購買';
+
+    finishButton.disabled =
+      !state.canBuy;
+
+    turnStatus.textContent =
+      state.buyFinished
+        ? '你已完成購買，等待其他玩家'
+        : '所有玩家可以同時購買';
+  }
+
+  renderPlayers(state);
+  renderHand(state);
+  renderPlayed(state);
+  renderSupply(state);
+  renderInteraction(state);
+  const emptyRule =
+    document.getElementById(
+      'emptyPileRuleText'
+    );
+
+  if (emptyRule) {
+    emptyRule.textContent =
+      '任意 ' +
+      Number(state.emptyPileLimit || 3) +
+      ' 個牌堆歸零';
+  }
+
+  renderEmptyPiles(state.supply || {});
+  renderLog(state.log || []);
+  renderResult(state);
+  renderTurnTimer(state);
+  renderServerAdvanceStatus(state);
+
+  if (deckInspectorOpen) {
+    renderDeckInspector();
+  }
+
+  scheduleAiStep(state);
+}
+
+function renderPlayers(state) {
+  const container =
+    document.getElementById('gamePlayers');
+
+  container.innerHTML = '';
+
+  state.players.forEach(function(player) {
+    const row = document.createElement('div');
+
+    const isActive =
+      state.phase === 'action' &&
+      player.id ===
+        state.activeActionPlayerId;
+
+    const finished =
+      state.phase === 'buy'
+        ? player.buyFinished
+        : player.actionFinished;
+
+    row.className =
+      'game-player-row' +
+      (player.isAi ? ' ai-player' : '') +
+      (isActive ? ' active' : '') +
+      (finished ? ' finished' : '');
+
+    row.innerHTML =
+      '<strong>' +
+      player.seat +
+      '. ' +
+      escapeHtml(player.name) +
+      (
+        player.isAi
+          ? ' <span class="ai-player-tag">AI</span>'
+          : ''
+      ) +
+      '</strong><div>' +
+      '手牌 ' +
+      player.handCount +
+      '｜牌庫 ' +
+      player.deckCount +
+      '｜棄牌 ' +
+      player.discardCount +
+      '</div><small>' +
+      (
+        player.isAi
+          ? (
+              finished
+                ? 'AI 已完成本階段'
+                : isActive
+                  ? 'AI 操作中'
+                  : 'AI 等待中'
+            )
+          : (
+              player.firebaseOnline === false
+                ? '🔴 Firebase 離線'
+                : player.firebaseOnline === true
+                  ? (
+                      finished
+                        ? '🟢 在線｜已完成本階段'
+                        : isActive
+                          ? '🟢 在線｜目前行動'
+                          : '🟢 在線｜等待中'
+                    )
+                  : (
+                      player.connected === false
+                        ? '離線（資料保留）'
+                        : finished
+                          ? '已完成本階段'
+                          : isActive
+                            ? '目前行動'
+                            : '等待中'
+                    )
+            )
+      ) +
+      '</small>';
+
+    container.appendChild(row);
+  });
+}
+
+function renderHand(state) {
+  const container =
+    document.getElementById('handCards');
+
+  container.innerHTML = '';
+
+  state.player.hand.forEach(function(
+    cardId,
+    index
+  ) {
+    const card =
+      getCardInfo(cardId);
+
+    const element =
+      document.createElement('button');
+
+    element.type = 'button';
+    element.className =
+      'text-card ' +
+      card.cssClass;
+
+    const canPlay =
+      state.isActionPlayer &&
+      !state.interaction &&
+      clientHasCardType_(card, 'action') &&
+      state.player.actions > 0;
+
+    element.disabled = !canPlay;
+
+    if (!canPlay) {
+      element.classList.add(
+        'disabled-card'
+      );
+    }
+
+    element.onclick = function() {
+      playActionClient(index);
+    };
+
+    element.innerHTML =
+      '<div><div>' +
+      escapeHtml(card.name) +
+      '</div><div class="card-description">' +
+      escapeHtml(card.description) +
+      '</div></div>';
+
+    container.appendChild(element);
+  });
+}
+
+function renderPlayed(state) {
+  const container =
+    document.getElementById('playedCards');
+
+  container.innerHTML = '';
+
+  state.player.play.forEach(function(cardId) {
+    const card = getCardInfo(cardId);
+    const element =
+      document.createElement('div');
+
+    element.className =
+      'played-card ' +
+      card.cssClass;
+
+    element.innerHTML =
+      '<div><div>' +
+      escapeHtml(card.name) +
+      '</div><div class="card-description">' +
+      escapeHtml(card.description) +
+      '</div></div>';
+
+    container.appendChild(element);
+  });
+}
+
+function renderSupply(state) {
+  const container =
+    document.getElementById('supplyCards');
+
+  container.innerHTML = '';
+
+  getOrderedSupplyIds(state.supply)
+    .forEach(function(cardId) {
+      const card = getCardInfo(cardId);
+      const remaining =
+        Number(state.supply[cardId] || 0);
+
+      const button =
+        document.createElement('button');
+
+      button.type = 'button';
+      button.className =
+        'supply-card ' +
+        card.cssClass;
+
+      button.disabled = !(
+        state.canBuy &&
+        remaining > 0 &&
+        state.player.buys > 0 &&
+        state.player.coins >= card.cost
+      );
+
+      button.onclick = function() {
+        buyCardClient(cardId);
+      };
+
+      button.innerHTML =
+        '<span class="supply-count">' +
+        remaining +
+        '</span><span class="supply-name">' +
+        escapeHtml(card.name) +
+        '</span><span class="supply-cost">費用：' +
+        card.cost +
+        '</span><span class="supply-description">' +
+        escapeHtml(card.description) +
+        '</span>';
+
+      container.appendChild(button);
+    });
+}
+
+function renderInteraction(state) {
+  const incomingInteractionId =
+    state &&
+    state.interaction
+      ? (
+          state.interaction.interactionId ||
+          ''
+        )
+      : '';
+
+  if (
+    incomingInteractionId &&
+    incomingInteractionId !==
+      lastRenderedInteractionId
+  ) {
+    lastRenderedInteractionId =
+      incomingInteractionId;
+
+    if (
+      interactionLockState.locked &&
+      interactionLockState.interactionId !==
+        incomingInteractionId
+    ) {
+      unlockInteraction_(
+        'new-interaction'
+      );
+    }
+
+    prepareInteractionForRender_(
+      state.interaction
+    );
+
+    addInteractionEvent_(
+      'RENDER',
+      incomingInteractionId +
+        '｜' +
+        String(state.interaction.type || '')
+    );
+  }
+
+  renderInteractionInspector_();
+
+  const panel =
+    document.getElementById(
+      'interactionPanel'
+    );
+
+  const reactionButtons =
+    document.getElementById(
+      'reactionButtons'
+    );
+
+  const handArea =
+    document.getElementById(
+      'handChoiceArea'
+    );
+
+  const supplyArea =
+    document.getElementById(
+      'supplyChoiceArea'
+    );
+
+  const specialArea =
+    document.getElementById(
+      'specialChoiceArea'
+    );
+
+  const cancelHandButton =
+    document.getElementById(
+      'cancelHandChoiceButton'
+    );
+
+  const cancelSupplyButton =
+    document.getElementById(
+      'cancelSupplyChoiceButton'
+    );
+
+  reactionButtons.classList.add('hidden');
+  handArea.classList.add('hidden');
+  supplyArea.classList.add('hidden');
+
+  if (specialArea) {
+    specialArea.classList.add('hidden');
+  }
+
+  if (cancelHandButton) {
+    cancelHandButton.classList.add('hidden');
+  }
+
+  if (cancelSupplyButton) {
+    cancelSupplyButton.classList.add('hidden');
+  }
+
+  if (!state.interaction) {
+    panel.classList.add('hidden');
+    selectedIndexes = [];
+    return;
+  }
+
+  panel.classList.remove('hidden');
+
+  if (!state.isInteractionPlayer) {
+    document.getElementById(
+      'interactionTitle'
+    ).textContent = '等待其他玩家';
+
+    document.getElementById(
+      'interactionMessage'
+    ).textContent =
+      '其他玩家正在處理卡片效果。';
+
+    return;
+  }
+
+  const interaction = state.interaction;
+
+  prepareInteractionForRender_(
+    interaction
+  );
+
+  if (interaction.type === 'reaction') {
+    prepareInteractionForRender_(
+      interaction
+    );
+
+    reactionButtons
+      .querySelectorAll('button')
+      .forEach(function(button) {
+        button.disabled = false;
+      });
+
+    const sourceCard =
+      getCardInfo(interaction.sourceCardId);
+
+    document.getElementById(
+      'interactionTitle'
+    ).textContent = '是否展示護城河？';
+
+    document.getElementById(
+      'interactionMessage'
+    ).textContent =
+      '你受到「' +
+      sourceCard.name +
+      '」攻擊。展示護城河即可免疫這次攻擊。';
+
+    reactionButtons.classList.remove(
+      'hidden'
+    );
+
+    return;
+  }
+
+  if (
+    interaction.type === 'discard' ||
+    interaction.type === 'selectHand'
+  ) {
+    document.getElementById(
+      'interactionTitle'
+    ).textContent = '選擇手牌';
+
+    document.getElementById(
+      'interactionMessage'
+    ).textContent =
+      getHandChoiceMessage(interaction);
+
+    handArea.classList.remove('hidden');
+
+    renderHandChoiceCards(
+      state.player.hand,
+      interaction
+    );
+
+    if (
+      interaction.type === 'selectHand' &&
+      interaction.allowCancel !== false &&
+      cancelHandButton
+    ) {
+      cancelHandButton.classList.remove(
+        'hidden'
+      );
+    }
+
+    return;
+  }
+
+
+  if (
+    interaction.type === 'libraryDecision'
+  ) {
+    renderLibraryDecision(
+      interaction
+    );
+    return;
+  }
+
+  if (
+    interaction.type === 'thiefTrashDecision'
+  ) {
+    renderThiefTrashDecision(
+      interaction
+    );
+    return;
+  }
+
+  if (
+    interaction.type === 'thiefGainDecision'
+  ) {
+    renderThiefGainDecision(
+      interaction
+    );
+    return;
+  }
+
+  if (
+    interaction.type === 'spyDecision'
+  ) {
+    renderSpyDecision(interaction);
+    return;
+  }
+
+  if (
+    interaction.type === 'thiefDecision'
+  ) {
+    renderThiefDecision(interaction);
+    return;
+  }
+
+  if (
+    interaction.type === 'selectSupply'
+  ) {
+    document.getElementById(
+      'interactionTitle'
+    ).textContent = '選擇供應區卡片';
+
+    document.getElementById(
+      'interactionMessage'
+    ).textContent =
+      '可選費用最高 ' +
+      interaction.maxCost +
+      ' 的卡片。';
+
+    supplyArea.classList.remove('hidden');
+
+    renderSupplyChoiceCards(
+      state.supply,
+      interaction
+    );
+
+    if (
+      interaction.allowCancel !== false &&
+      cancelSupplyButton
+    ) {
+      cancelSupplyButton.classList.remove(
+        'hidden'
+      );
+    }
+  }
+}
+
+
+
+function renderLibraryDecision(
+  interaction
+) {
+  prepareInteractionForRender_(
+    interaction
+  );
+
+  const area =
+    document.getElementById(
+      'specialChoiceArea'
+    );
+
+  const cards =
+    document.getElementById(
+      'specialChoiceCards'
+    );
+
+  const buttons =
+    document.getElementById(
+      'specialChoiceButtons'
+    );
+
+  const card =
+    getCardInfo(
+      interaction.revealedCardId
+    );
+
+  document.getElementById(
+    'interactionTitle'
+  ).textContent =
+    '圖書館：翻到行動卡';
+
+  document.getElementById(
+    'interactionMessage'
+  ).textContent =
+    '目前手牌 ' +
+    Number(
+      interaction.currentHandSize || 0
+    ) +
+    '／' +
+    Number(
+      interaction.targetHandSize || 7
+    ) +
+    '。是否保留「' +
+    card.name +
+    '」？';
+
+  cards.innerHTML =
+    createSpecialCardHtml(
+      interaction.revealedCardId
+    );
+
+  buttons.innerHTML =
+    '<button class="btn btn-primary" type="button" ' +
+    'onclick="submitSpecialActionClient(\'keep\')">' +
+    '加入手牌</button>' +
+    '<button class="btn btn-secondary" type="button" ' +
+    'onclick="submitSpecialActionClient(\'setaside\')">' +
+    '暫時旁置</button>';
+
+  area.classList.remove('hidden');
+}
+
+function renderThiefTrashDecision(
+  interaction
+) {
+  if (
+    !interactionLockState.locked ||
+    interactionLockState.interactionId !==
+      interaction.interactionId
+  ) {
+    clearSpecialChoicePending_();
+  }
+
+  const area =
+    document.getElementById(
+      'specialChoiceArea'
+    );
+
+  const cards =
+    document.getElementById(
+      'specialChoiceCards'
+    );
+
+  const buttons =
+    document.getElementById(
+      'specialChoiceButtons'
+    );
+
+  document.getElementById(
+    'interactionTitle'
+  ).textContent =
+    '小偷：選擇要移除的寶物';
+
+  document.getElementById(
+    'interactionMessage'
+  ).textContent =
+    interaction.targetPlayerName +
+    ' 翻開以下卡片。';
+
+  cards.innerHTML =
+    (
+      interaction.revealedCardIds ||
+      []
+    )
+      .map(createSpecialCardHtml)
+      .join('');
+
+  buttons.innerHTML =
+    (
+      interaction.treasureOptions ||
+      []
+    )
+      .map(function(cardId) {
+        const card =
+          getCardInfo(cardId);
+
+        return (
+          '<button class="btn btn-danger" type="button" ' +
+          'onclick="submitSpecialCardClient(\'' +
+          escapeHtml(cardId) +
+          '\')">移除「' +
+          escapeHtml(card.name) +
+          '」</button>'
+        );
+      })
+      .join('');
+
+  area.classList.remove('hidden');
+}
+
+function renderThiefGainDecision(
+  interaction
+) {
+  if (
+    !interactionLockState.locked ||
+    interactionLockState.interactionId !==
+      interaction.interactionId
+  ) {
+    clearSpecialChoicePending_();
+  }
+
+  const area =
+    document.getElementById(
+      'specialChoiceArea'
+    );
+
+  const cards =
+    document.getElementById(
+      'specialChoiceCards'
+    );
+
+  const buttons =
+    document.getElementById(
+      'specialChoiceButtons'
+    );
+
+  const card =
+    getCardInfo(
+      interaction.trashedCardId
+    );
+
+  document.getElementById(
+    'interactionTitle'
+  ).textContent =
+    '小偷：是否獲得寶物';
+
+  document.getElementById(
+    'interactionMessage'
+  ).textContent =
+    '已移除「' +
+    card.name +
+    '」，是否將它放入自己的棄牌堆？';
+
+  cards.innerHTML =
+    createSpecialCardHtml(
+      interaction.trashedCardId
+    );
+
+  buttons.innerHTML =
+    '<button class="btn btn-primary" type="button" ' +
+    'onclick="submitSpecialActionClient(\'gain\')">' +
+    '獲得寶物</button>' +
+    '<button class="btn btn-secondary" type="button" ' +
+    'onclick="submitSpecialActionClient(\'leave\')">' +
+    '不要寶物</button>';
+
+  area.classList.remove('hidden');
+}
+
+function submitSpecialActionClient(
+  action
+) {
+  submitFormalSpecialChoice_({
+    action:action
+  });
+}
+
+function submitSpecialCardClient(
+  cardId
+) {
+  submitFormalSpecialChoice_({
+    cardId:cardId
+  });
+}
+
+
+
+
+function addInteractionEvent_(name, details) {
+  interactionEventLog.push({
+    time:new Date().toLocaleTimeString(
+      'zh-TW',
+      {hour12:false}
+    ),
+    name:String(name || ''),
+    details:
+      details == null
+        ? ''
+        : String(details)
+  });
+
+  if (interactionEventLog.length > 30) {
+    interactionEventLog.splice(
+      0,
+      interactionEventLog.length - 30
+    );
+  }
+
+  renderInteractionInspector_();
+}
+
+function getCurrentInteractionId_() {
+  return (
+    latestGameState &&
+    latestGameState.interaction &&
+    latestGameState.interaction.interactionId
+  ) || '';
+}
+
+function lockInteraction_(reason) {
+  interactionLockState.locked = true;
+  interactionLockState.reason =
+    String(reason || 'submit');
+  interactionLockState.lockedAt = Date.now();
+  interactionLockState.interactionId =
+    getCurrentInteractionId_();
+  interactionLockState.submitSerial += 1;
+
+  markSpecialChoicePending_();
+
+  addInteractionEvent_(
+    'LOCK',
+    interactionLockState.interactionId +
+      '｜' +
+      interactionLockState.reason
+  );
+}
+
+function unlockInteraction_(reason) {
+  const oldId =
+    interactionLockState.interactionId;
+
+  interactionLockState.locked = false;
+  interactionLockState.reason = '';
+  interactionLockState.lockedAt = 0;
+  interactionLockState.interactionId = '';
+
+  clearSpecialChoicePending_();
+
+  addInteractionEvent_(
+    'UNLOCK',
+    oldId +
+      '｜' +
+      String(reason || 'complete')
+  );
+}
+
+function shouldUnlockForSnapshot_(state) {
+  if (!interactionLockState.locked) {
+    return false;
+  }
+
+  const incomingId =
+    state &&
+    state.interaction
+      ? (state.interaction.interactionId || '')
+      : '';
+
+  return (
+    !incomingId ||
+    incomingId !==
+      interactionLockState.interactionId
+  );
+}
+
+
+function prepareInteractionForRender_(
+  interaction
+) {
+  const incomingId =
+    interaction
+      ? (
+          interaction.interactionId ||
+          ''
+        )
+      : '';
+
+  /*
+   * 新的 interactionId 代表上一個選擇已完成。
+   * 即使 lockInteractionState 已先被其他同步流程清空，
+   * DOM 上仍可能殘留 interaction-pending。
+   *
+   * 因此只要：
+   * - 目前沒有鎖；或
+   * - 鎖定的是另一個 interactionId
+   * 就強制恢復按鈕點擊。
+   */
+  if (
+    !interactionLockState.locked ||
+    interactionLockState.interactionId !==
+      incomingId
+  ) {
+    clearSpecialChoicePending_();
+
+    const area =
+      document.getElementById(
+        'specialChoiceArea'
+      );
+
+    if (area) {
+      area.classList.remove(
+        'interaction-pending'
+      );
+    }
+
+    const buttons =
+      document.getElementById(
+        'specialChoiceButtons'
+      );
+
+    if (buttons) {
+      buttons
+        .querySelectorAll('button')
+        .forEach(function(button) {
+          button.disabled = false;
+        });
+    }
+  }
+}
+
+
+function getEffectStackSignature_(
+  effectEngine
+) {
+  if (!effectEngine) return '';
+
+  return JSON.stringify({
+    version:effectEngine.stackVersion || 0,
+    depth:effectEngine.stackDepth || 0,
+    ids:(effectEngine.stack || []).map(
+      function(frame) {
+        return frame.frameId + ':' + frame.status;
+      }
+    )
+  });
+}
+
+
+
+
+function renderAiActionEngineInspector_(
+  aiEngine
+) {
+  const status =
+    document.getElementById(
+      'aiActionEngineStatus'
+    );
+
+  const list =
+    document.getElementById(
+      'aiActionEngineCandidates'
+    );
+
+  const players =
+    aiEngine &&
+    Array.isArray(aiEngine.activePlayers)
+      ? aiEngine.activePlayers
+      : [];
+
+  const latest =
+    players
+      .filter(function(item) {
+        return Boolean(
+          item.lastActionAnalysis
+        );
+      })
+      .sort(function(a, b) {
+        return String(
+          b.lastActionAnalysis
+            .createdAt || ''
+        ).localeCompare(
+          String(
+            a.lastActionAnalysis
+              .createdAt || ''
+          )
+        );
+      })[0];
+
+  if (status) {
+    status.textContent =
+      latest
+        ? latest.playerName
+        : '尚無行動評分';
+  }
+
+  if (!list) return;
+
+  if (!latest) {
+    list.innerHTML =
+      '<div class="firebase-debug-empty">尚無 AI 行動評分紀錄</div>';
+    return;
+  }
+
+  const analysis =
+    latest.lastActionAnalysis;
+
+  const candidates =
+    Array.isArray(
+      analysis.candidates
+    )
+      ? analysis.candidates
+      : [];
+
+  list.innerHTML =
+    '<div class="ai-engine-player">' +
+    escapeHtml(
+      latest.playerName || 'AI'
+    ) +
+    '｜剩餘行動 ' +
+    escapeHtml(
+      String(
+        analysis.remainingActions || 0
+      )
+    ) +
+    '</div>' +
+    (
+      candidates.length
+        ? candidates.map(
+            function(item, index) {
+              const card =
+                cardCatalog[
+                  item.cardId
+                ];
+
+              return (
+                '<div class="ai-engine-candidate">' +
+                '<strong>' +
+                (index + 1) +
+                '. ' +
+                escapeHtml(
+                  card
+                    ? card.name
+                    : item.cardId
+                ) +
+                '</strong>' +
+                '<span>' +
+                escapeHtml(
+                  String(item.score)
+                ) +
+                '</span>' +
+                '<small>' +
+                escapeHtml(
+                  item.reason || ''
+                ) +
+                '</small>' +
+                '</div>'
+              );
+            }
+          ).join('')
+        : '<div class="firebase-debug-empty">沒有可執行的行動卡</div>'
+    );
+}
+
+function renderAiEngineInspector_(
+  aiEngine
+) {
+  const status =
+    document.getElementById(
+      'aiEngineStatus'
+    );
+
+  const list =
+    document.getElementById(
+      'aiEngineCandidates'
+    );
+
+  const players =
+    aiEngine &&
+    Array.isArray(aiEngine.activePlayers)
+      ? aiEngine.activePlayers
+      : [];
+
+  if (status) {
+    status.textContent =
+      players.length
+        ? (
+            players.length +
+            ' 名 AI 啟用'
+          )
+        : '沒有 AI';
+  }
+
+  if (!list) return;
+
+  const latest =
+    players
+      .filter(function(item) {
+        return Boolean(
+          item.lastPurchaseAnalysis
+        );
+      })
+      .sort(function(a, b) {
+        return String(
+          b.lastPurchaseAnalysis
+            .createdAt || ''
+        ).localeCompare(
+          String(
+            a.lastPurchaseAnalysis
+              .createdAt || ''
+          )
+        );
+      })[0];
+
+  if (!latest) {
+    list.innerHTML =
+      '<div class="firebase-debug-empty">尚無購牌評分紀錄</div>';
+    return;
+  }
+
+  const analysis =
+    latest.lastPurchaseAnalysis;
+
+  const candidates =
+    Array.isArray(
+      analysis.candidates
+    )
+      ? analysis.candidates
+      : [];
+
+  const strategy =
+    analysis.strategy || {};
+
+  const metrics =
+    analysis.deckMetrics || {};
+
+  list.innerHTML =
+    '<div class="ai-engine-player">' +
+    escapeHtml(
+      latest.playerName || 'AI'
+    ) +
+    '｜' +
+    escapeHtml(
+      latest.difficulty || 'normal'
+    ) +
+    '｜金錢 ' +
+    escapeHtml(
+      String(analysis.coins || 0)
+    ) +
+    '</div>' +
+    '<div class="ai-engine-strategy">' +
+    '策略：' +
+    escapeHtml(
+      strategy.name || '未決定'
+    ) +
+    '<small>' +
+    escapeHtml(
+      strategy.reason || ''
+    ) +
+    '</small>' +
+    '</div>' +
+    '<div class="ai-engine-metrics">' +
+    '牌組 ' +
+    escapeHtml(
+      String(metrics.totalCards || 0)
+    ) +
+    '｜行動 ' +
+    escapeHtml(
+      String(metrics.actionCount || 0)
+    ) +
+    '｜抽牌 ' +
+    escapeHtml(
+      String(metrics.drawCount || 0)
+    ) +
+    '｜攻擊 ' +
+    escapeHtml(
+      String(metrics.attackCount || 0)
+    ) +
+    '｜廢牌 ' +
+    escapeHtml(
+      String(metrics.junkCount || 0)
+    ) +
+    '</div>' +
+    (
+      candidates.length
+        ? candidates.map(
+            function(item, index) {
+              const card =
+                cardCatalog[
+                  item.cardId
+                ];
+
+              return (
+                '<div class="ai-engine-candidate">' +
+                '<strong>' +
+                (index + 1) +
+                '. ' +
+                escapeHtml(
+                  card
+                    ? card.name
+                    : item.cardId
+                ) +
+                '</strong>' +
+                '<span>' +
+                escapeHtml(
+                  String(item.score)
+                ) +
+                '</span>' +
+                '<small>' +
+                escapeHtml(
+                  item.reason || ''
+                ) +
+                '</small>' +
+                '</div>'
+              );
+            }
+          ).join('')
+        : '<div class="firebase-debug-empty">沒有可購買候選</div>'
+    );
+}
+
+
+function formatRoomDataSize_(bytes) {
+  const value = Number(bytes || 0);
+
+  if (value >= 1024 * 1024) {
+    return (
+      Math.round(
+        value / 1024 / 1024 * 10
+      ) / 10
+    ) + ' MB';
+  }
+
+  return (
+    Math.round(
+      value / 1024 * 10
+    ) / 10
+  ) + ' KB';
+}
+
+function renderSafeCompleteInspector_(data) {
+  data = data || {count:0, recent:[]};
+  const count = document.getElementById('safeCompleteCount');
+  const list = document.getElementById('safeCompleteRecent');
+  if (count) count.textContent = String(data.count || 0);
+  if (!list) return;
+  const recent = Array.isArray(data.recent) ? data.recent.slice().reverse() : [];
+  list.innerHTML = recent.length
+    ? recent.map(function(item) {
+        const card = cardCatalog[item.cardId];
+        return '<div class="safe-complete-item">' +
+          '<strong>' + escapeHtml(card ? card.name : (item.cardId || '系統')) + '</strong>' +
+          '<span>' + escapeHtml(item.reason || '') + '</span>' +
+          '<small>' + escapeHtml(formatChatTime_(item.createdAt)) + '</small>' +
+          '</div>';
+      }).join('')
+    : '<div class="firebase-debug-empty">尚無 Safe Complete 紀錄</div>';
+}
+
+function renderRoomHealthInspector_(
+  roomHealth
+) {
+  const health = roomHealth || {};
+
+  const values = {
+    roomHealthStatus:
+      health.status === 'healthy'
+        ? '正常'
+        : (
+            health.status === 'repaired'
+              ? '已修復'
+              : '處理中'
+          ),
+    roomHealthActionable:
+      String(
+        health.actionablePlayers || 0
+      ),
+    roomHealthInteraction:
+      String(
+        health.interactionDepth || 0
+      ),
+    roomHealthEffect:
+      String(
+        health.effectDepth || 0
+      ),
+    roomHealthAttack:
+      String(
+        health.attackDepth || 0
+      ),
+    roomHealthRepair:
+      health.lastRepairMessage || '無',
+    roomHealthDataSize:
+      formatRoomDataSize_(
+        health.dataSizeBytes || 0
+      )
+  };
+
+  Object.keys(values)
+    .forEach(function(id) {
+      const element =
+        document.getElementById(id);
+
+      if (element) {
+        element.textContent =
+          values[id];
+      }
+    });
+}
+
+function repairRoomClient() {
+  if (!currentRoomNumber || !playerId) {
+    showMessage(
+      '請先進入房間。',
+      true
+    );
+    return;
+  }
+
+  const button =
+    document.getElementById(
+      'repairRoomButton'
+    );
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = '修復中…';
+  }
+
+  google.script.run
+    .withSuccessHandler(function(result) {
+      if (button) {
+        button.disabled = false;
+        button.textContent = '修復房間';
+      }
+
+      applyEngineActionResult_(
+        result,
+        'manual-room-repair'
+      );
+
+      showMessage(
+        result && result.message
+          ? result.message
+          : '房間修復完成。'
+      );
+    })
+    .withFailureHandler(function(error) {
+      if (button) {
+        button.disabled = false;
+        button.textContent = '修復房間';
+      }
+
+      showMessage(
+        error && error.message
+          ? error.message
+          : '房間修復失敗。',
+        true
+      );
+    })
+    .repairRoomManually(
+      currentRoomNumber,
+      playerId
+    );
+}
+
+function renderAttackEngineInspector_(
+  attackEngine
+) {
+  const source =
+    document.getElementById(
+      'attackEngineSource'
+    );
+
+  const progress =
+    document.getElementById(
+      'attackEngineProgress'
+    );
+
+  const status =
+    document.getElementById(
+      'attackEngineStatus'
+    );
+
+  const engine =
+    attackEngine || {
+      depth:0,
+      active:null
+    };
+
+  if (source) {
+    source.textContent =
+      engine.active
+        ? (
+            cardCatalog[
+              engine.active.sourceCardId
+            ]
+              ? cardCatalog[
+                  engine.active.sourceCardId
+                ].name
+              : engine.active.sourceCardId
+          )
+        : '—';
+  }
+
+  if (progress) {
+    progress.textContent =
+      engine.active
+        ? (
+            (
+              Number(
+                engine.active
+                  .currentTargetIndex || 0
+              ) + 1
+            ) +
+            ' / ' +
+            Number(
+              engine.active
+                .targetCount || 0
+            )
+          )
+        : '0 / 0';
+  }
+
+  if (status) {
+    status.textContent =
+      engine.active
+        ? (
+            engine.active.status || 'running'
+          )
+        : '閒置';
+  }
+}
+
+function renderEffectStackInspector_(
+  effectEngine
+) {
+  const engineVersion =
+    document.getElementById(
+      'effectEngineVersion'
+    );
+
+  const depth =
+    document.getElementById('effectStackDepth');
+  const version =
+    document.getElementById('effectStackVersion');
+  const list =
+    document.getElementById('effectStackFrames');
+  const repairButton =
+    document.getElementById(
+      'repairEffectStackButton'
+    );
+
+  const engine =
+    effectEngine || {
+      stackDepth:0,
+      stackVersion:0,
+      stack:[]
+    };
+
+  if (engineVersion) {
+    engineVersion.textContent =
+      String(engine.engineVersion || 0);
+  }
+
+  if (depth) {
+    depth.textContent =
+      String(engine.stackDepth || 0);
+  }
+
+  if (version) {
+    version.textContent =
+      String(engine.stackVersion || 0);
+  }
+
+  if (list) {
+    const frames =
+      Array.isArray(engine.stack)
+        ? engine.stack.slice().reverse()
+        : [];
+
+    list.innerHTML =
+      frames.length
+        ? frames.map(function(frame, index) {
+            return (
+              '<div class="effect-stack-frame">' +
+              '<div>' +
+              '&nbsp;'.repeat(index * 4) +
+              escapeHtml(frame.type || 'unknown') +
+              '</div>' +
+              '<small>' +
+              escapeHtml(frame.frameId || '') +
+              '｜' +
+              escapeHtml(frame.status || '') +
+              '</small>' +
+              '</div>'
+            );
+          }).join('')
+        : '<div class="firebase-debug-empty">效果堆疊為空</div>';
+  }
+
+  const signature =
+    getEffectStackSignature_(engine);
+
+  if (signature !== lastEffectStackSignature) {
+    lastEffectStackSignature = signature;
+    lastEffectStackProgressAt = Date.now();
+  }
+
+  const abnormal =
+    Boolean(
+      engine.stackDepth > 0 &&
+      !engine.hasPendingInteraction &&
+      Date.now() -
+        lastEffectStackProgressAt >
+        2500
+    );
+
+  if (repairButton) {
+    repairButton.classList.toggle(
+      'hidden',
+      !abnormal
+    );
+  }
+}
+
+function repairEffectStackClient() {
+  if (
+    !currentRoomNumber ||
+    actionInProgress
+  ) {
+    return;
+  }
+
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .repairEffectStack(
+          currentRoomNumber,
+          playerId
+        );
+    },
+    function(result) {
+      if (result && result.state) {
+        applyServerSnapshot(result.state);
+        publishFirebasePublicState_(
+          result.state,
+          'effect-stack-repair'
+        );
+      }
+
+      showMessage(
+        result.message ||
+        '效果堆疊已重新推進。'
+      );
+    }
+  );
+}
+
+function renderInteractionInspector_() {
+  const status =
+    document.getElementById(
+      'interactionInspectorStatus'
+    );
+  const current =
+    document.getElementById(
+      'interactionInspectorCurrent'
+    );
+  const events =
+    document.getElementById(
+      'interactionInspectorEvents'
+    );
+
+  if (status) {
+    status.textContent =
+      interactionLockState.locked
+        ? '🔒 已鎖定'
+        : '🔓 可操作';
+  }
+
+  if (current) {
+    current.textContent =
+      getCurrentInteractionId_() || '—';
+  }
+
+  if (events) {
+    events.innerHTML =
+      interactionEventLog.length
+        ? interactionEventLog
+            .slice()
+            .reverse()
+            .map(function(item) {
+              return (
+                '<div class="interaction-inspector-event">' +
+                '<span>' +
+                escapeHtml(item.time) +
+                '</span>' +
+                '<strong>' +
+                escapeHtml(item.name) +
+                '</strong>' +
+                '<div>' +
+                escapeHtml(item.details) +
+                '</div></div>'
+              );
+            })
+            .join('')
+        : '<div class="firebase-debug-empty">尚無互動事件</div>';
+  }
+}
+
+function clearSpecialChoicePending_() {
+  const area =
+    document.getElementById(
+      'specialChoiceArea'
+    );
+
+  const buttons =
+    document.getElementById(
+      'specialChoiceButtons'
+    );
+
+  if (buttons) {
+    buttons
+      .querySelectorAll('button')
+      .forEach(function(button) {
+        button.disabled = false;
+      });
+  }
+
+  if (area) {
+    area.classList.remove(
+      'interaction-pending'
+    );
+  }
+}
+
+function markSpecialChoicePending_() {
+  const area =
+    document.getElementById(
+      'specialChoiceArea'
+    );
+
+  const buttons =
+    document.getElementById(
+      'specialChoiceButtons'
+    );
+
+  const message =
+    document.getElementById(
+      'interactionMessage'
+    );
+
+  if (buttons) {
+    buttons
+      .querySelectorAll('button')
+      .forEach(function(button) {
+        button.disabled = true;
+      });
+  }
+
+  if (message) {
+    message.textContent =
+      '已收到選擇，正在執行…';
+  }
+
+  if (area) {
+    area.classList.add(
+      'interaction-pending'
+    );
+  }
+}
+
+function submitFormalSpecialChoice_(
+  choice
+) {
+  if (interactionLockState.locked) {
+    return;
+  }
+
+  lockInteraction_('special-choice');
+
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .submitSpecialInteractionChoice(
+          currentRoomNumber,
+          playerId,
+          choice
+        );
+    },
+    function(result) {
+      /*
+       * 上一個特殊選擇已由伺服器確認。
+       * 必須先移除 interaction-pending，
+       * 否則下一個「小偷是否獲得寶物」雖然顯示，
+       * 仍會被 pointer-events:none 擋住。
+       */
+      unlockInteraction_(
+        'server-confirmed'
+      );
+
+      if (result && result.state) {
+        applyServerSnapshot(
+          result.state
+        );
+
+        if (
+          result.state.interaction
+        ) {
+          prepareInteractionForRender_(
+            result.state.interaction
+          );
+        } else {
+          clearSpecialChoicePending_();
+        }
+
+        publishFirebasePublicState_(
+          result.state,
+          'special-interaction'
+        );
+      } else {
+        fastSyncClientState(function(state) {
+          publishFirebasePublicState_(
+            state,
+            'special-interaction'
+          );
+        });
+      }
+
+      if (
+        typeof firebaseBridgePublishEvent ===
+          'function'
+      ) {
+        firebaseBridgePublishEvent(
+          'private-interaction-ready',
+          {
+            playerId:
+              result &&
+              result.state &&
+              result.state.interaction
+                ? result.state
+                    .interaction.playerId
+                : '',
+            version:
+              Number(
+                result &&
+                result.state &&
+                result.state.version || 0
+              )
+          }
+        );
+      }
+
+      showMessage(result.message);
+    }
+  );
+}
+
+function renderSpyDecision(interaction) {
+  prepareInteractionForRender_(
+    interaction
+  );
+
+  const area =
+    document.getElementById(
+      'specialChoiceArea'
+    );
+
+  const cards =
+    document.getElementById(
+      'specialChoiceCards'
+    );
+
+  const buttons =
+    document.getElementById(
+      'specialChoiceButtons'
+    );
+
+  const card =
+    getCardInfo(
+      interaction.revealedCardId
+    );
+
+  document.getElementById(
+    'interactionTitle'
+  ).textContent = '間諜：決定牌庫頂';
+
+  document.getElementById(
+    'interactionMessage'
+  ).textContent =
+    (
+      interaction.targetIsActor
+        ? '你自己的'
+        : interaction.targetPlayerName + ' 的'
+    ) +
+    '牌庫頂是「' +
+    card.name +
+    '」。';
+
+  cards.innerHTML =
+    createSpecialCardHtml(
+      interaction.revealedCardId
+    );
+
+  buttons.innerHTML =
+    '<button class="btn btn-primary" type="button" ' +
+    'onclick="submitSpyDecisionClient(\'keep\')">' +
+    '保留在牌庫頂</button>' +
+    '<button class="btn btn-danger" type="button" ' +
+    'onclick="submitSpyDecisionClient(\'discard\')">' +
+    '棄掉</button>';
+
+  area.classList.remove('hidden');
+}
+
+function renderThiefDecision(interaction) {
+  const area =
+    document.getElementById(
+      'specialChoiceArea'
+    );
+
+  const cards =
+    document.getElementById(
+      'specialChoiceCards'
+    );
+
+  const buttons =
+    document.getElementById(
+      'specialChoiceButtons'
+    );
+
+  document.getElementById(
+    'interactionTitle'
+  ).textContent = '小偷：選擇偷取的寶物';
+
+  document.getElementById(
+    'interactionMessage'
+  ).textContent =
+    interaction.targetPlayerName +
+    ' 翻開以下卡片。';
+
+  cards.innerHTML =
+    (interaction.revealedCardIds || [])
+      .map(createSpecialCardHtml)
+      .join('');
+
+  buttons.innerHTML =
+    (interaction.treasureOptions || [])
+      .map(function(cardId) {
+        const card =
+          getCardInfo(cardId);
+
+        return (
+          '<button class="btn btn-primary" type="button" ' +
+          'onclick="submitThiefDecisionClient(\'' +
+          escapeHtml(cardId) +
+          '\')">偷走「' +
+          escapeHtml(card.name) +
+          '」</button>'
+        );
+      })
+      .join('') +
+    '<button class="btn btn-secondary" type="button" ' +
+    'onclick="submitThiefDecisionClient(\'none\')">' +
+    '都不偷</button>';
+
+  area.classList.remove('hidden');
+}
+
+function createSpecialCardHtml(cardId) {
+  const card =
+    getCardInfo(cardId);
+
+  return (
+    '<div class="special-revealed-card ' +
+    escapeHtml(card.cssClass) +
+    '"><strong>' +
+    escapeHtml(card.name) +
+    '</strong><small>費用：' +
+    Number(card.cost || 0) +
+    '</small><small>' +
+    escapeHtml(card.description) +
+    '</small></div>'
+  );
+}
+
+function getHandChoiceMessage(interaction) {
+  if (interaction.type === 'discard') {
+    return '請選擇 ' +
+      interaction.requiredDiscardCount +
+      ' 張牌棄掉。';
+  }
+
+  if (interaction.mode === 'trash') {
+    return '請選擇要永久移除的牌。';
+  }
+
+  if (interaction.mode === 'discardDraw') {
+    return '請選擇要棄掉並重抽的牌。';
+  }
+
+  if (interaction.mode === 'trashThenGain') {
+    return interaction.allowedType === 'treasure'
+      ? '請選擇 1 張寶物牌移除。'
+      : '請選擇 1 張牌移除。';
+  }
+
+  if (interaction.mode === 'repeatAction') {
+    return '請選擇 1 張行動卡執行兩次；也可以按「放棄效果」。';
+  }
+
+  return '請選擇手牌。';
+}
+
+function renderHandChoiceCards(
+  cards,
+  interaction
+) {
+  const container =
+    document.getElementById(
+      'handChoiceCards'
+    );
+
+  container.innerHTML = '';
+
+  const minimum =
+    interaction.type === 'discard'
+      ? interaction.requiredDiscardCount
+      : Number(interaction.min || 0);
+
+  const maximum =
+    interaction.type === 'discard'
+      ? interaction.requiredDiscardCount
+      : Number(
+          interaction.max == null
+            ? cards.length
+            : interaction.max
+        );
+
+  cards.forEach(function(cardId, index) {
+    const card = getCardInfo(cardId);
+    const button =
+      document.createElement('button');
+
+    const typeAllowed =
+      !interaction.allowedType ||
+      card.type === interaction.allowedType;
+
+    button.type = 'button';
+    button.className =
+      'choice-card ' +
+      card.cssClass;
+
+    button.disabled = !typeAllowed;
+
+    if (
+      selectedIndexes.indexOf(index) !== -1
+    ) {
+      button.classList.add('selected');
+    }
+
+    button.innerHTML =
+      '<strong>' +
+      escapeHtml(card.name) +
+      '</strong><small>' +
+      escapeHtml(card.description) +
+      '</small>';
+
+    button.onclick = function() {
+      if (!typeAllowed) return;
+
+      const position =
+        selectedIndexes.indexOf(index);
+
+      if (position !== -1) {
+        selectedIndexes.splice(position, 1);
+      } else if (
+        selectedIndexes.length < maximum
+      ) {
+        selectedIndexes.push(index);
+      }
+
+      renderHandChoiceCards(
+        cards,
+        interaction
+      );
+    };
+
+    container.appendChild(button);
+  });
+
+  const confirm =
+    document.getElementById(
+      'confirmHandChoiceButton'
+    );
+
+  confirm.textContent =
+    '確認（' +
+    selectedIndexes.length +
+    ' / ' +
+    minimum +
+    '～' +
+    maximum +
+    '）';
+
+  confirm.disabled =
+    selectedIndexes.length < minimum ||
+    selectedIndexes.length > maximum;
+}
+
+function renderSupplyChoiceCards(
+  supply,
+  interaction
+) {
+  const container =
+    document.getElementById(
+      'supplyChoiceCards'
+    );
+
+  container.innerHTML = '';
+
+  getOrderedSupplyIds(supply)
+    .forEach(function(cardId) {
+      const card = getCardInfo(cardId);
+      const remaining =
+        Number(supply[cardId] || 0);
+
+      const canChoose =
+        remaining > 0 &&
+        card.cost <=
+          Number(interaction.maxCost || 0) &&
+        (
+          !interaction.allowedType ||
+          card.type ===
+            interaction.allowedType
+        );
+
+      const button =
+        document.createElement('button');
+
+      button.type = 'button';
+      button.className =
+        'supply-choice-card ' +
+        card.cssClass;
+
+      button.disabled = !canChoose;
+
+      button.innerHTML =
+        '<span class="supply-count">' +
+        remaining +
+        '</span><strong>' +
+        escapeHtml(card.name) +
+        '</strong><small>費用：' +
+        card.cost +
+        '</small>';
+
+      button.onclick = function() {
+        selectSupplyChoiceClient(cardId);
+      };
+
+      container.appendChild(button);
+    });
+}
+
+function renderEmptyPiles(supply) {
+  const emptyIds =
+    Object.keys(supply).filter(function(cardId) {
+      return Number(supply[cardId] || 0) <= 0;
+    });
+
+  const element =
+    document.getElementById(
+      'emptyPileStatus'
+    );
+
+  element.textContent =
+    '目前空牌堆：' +
+    emptyIds.length +
+    (
+      emptyIds.length
+        ? '（' +
+          emptyIds.map(function(cardId) {
+            return getCardInfo(cardId).name;
+          }).join('、') +
+          '）'
+        : ''
+    );
+
+  element.classList.toggle(
+    'warning',
+    emptyIds.length >= 2
+  );
+}
+
+function renderLog(logItems) {
+  const container =
+    document.getElementById('gameLog');
+
+  container.innerHTML = '';
+
+  if (!logItems.length) {
+    container.textContent = '尚無紀錄';
+    return;
+  }
+
+  logItems
+    .slice()
+    .reverse()
+    .forEach(function(item) {
+      const row =
+        document.createElement('div');
+
+      row.className = 'log-row';
+      row.textContent =
+        item.playerName +
+        '：' +
+        item.text;
+
+      container.appendChild(row);
+    });
+}
+
+function renderResult(state) {
+  const panel = document.getElementById('gameResultPanel');
+
+  if (!state.gameOver || !state.result) {
+    panel.classList.add('hidden');
+    return;
+  }
+
+  panel.classList.remove('hidden');
+
+  const container = document.getElementById('resultRanking');
+
+  container.innerHTML =
+    '<div class="result-ranking">' +
+    state.result.rankings.map(function(item, index) {
+      return '<div class="result-row"><strong>' +
+        (index + 1) + '. ' + escapeHtml(item.name) +
+        '</strong><span>' + item.score + ' 分</span></div>';
+    }).join('') +
+    '</div>';
+
+  showWinnerOverlay(state.result);
+}
+
+function showWinnerOverlay(result) {
+  if (!result || !Array.isArray(result.winners)) return;
+
+  const resultKey =
+    String(result.roundNumber || '') + ':' +
+    result.winners.map(function(item) {
+      return item.id + '-' + item.score;
+    }).join('|');
+
+  if (resultKey && resultKey === lastShownResultKey) return;
+  lastShownResultKey = resultKey;
+
+  const overlay = document.getElementById('winnerOverlay');
+  const nameElement = document.getElementById('winnerBigName');
+  const scoreElement = document.getElementById('winnerBigScore');
+  const messageElement = document.getElementById('winnerSubMessage');
+  const rankingElement = document.getElementById('winnerRankingPreview');
+
+  const winners = result.winners || [];
+  const isDraw = winners.length > 1;
+
+  nameElement.textContent = isDraw
+    ? winners.map(function(item) { return item.name; }).join(' ＆ ')
+    : (winners[0] ? winners[0].name : '勝利者');
+
+  scoreElement.textContent = Number(result.topScore || 0) + ' 分';
+  messageElement.textContent = isDraw
+    ? '本局由多位玩家並列第一！'
+    : '恭喜成為本局冠軍！';
+
+  rankingElement.innerHTML = (result.rankings || [])
+    .slice(0, 4)
+    .map(function(item, index) {
+      return '<span class="winner-ranking-chip">' +
+        (index + 1) + '. ' + escapeHtml(item.name) +
+        '　' + Number(item.score || 0) + ' 分</span>';
+    }).join('');
+
+  overlay.classList.remove('hidden');
+}
+
+function closeWinnerOverlay() {
+  const overlay = document.getElementById('winnerOverlay');
+  if (overlay) overlay.classList.add('hidden');
+
+  const resultPanel = document.getElementById('gameResultPanel');
+  if (resultPanel) {
+    resultPanel.scrollIntoView({behavior:'smooth', block:'start'});
+  }
+}
+
+function getCardInfo(cardId) {
+  const card =
+    cardCatalog[cardId] || {};
+
+  return {
+    id:cardId,
+    name:card.name || cardId,
+    type:card.type || 'other',
+    cssClass:
+      card.cssClass ||
+      card.type ||
+      'other',
+    cost:Number(card.cost || 0),
+    description:
+      card.description || '',
+    supplyGroup:
+      Number(card.supplyGroup || 999),
+    supplyOrder:
+      Number(card.supplyOrder || 999)
+  };
+}
+
+function getOrderedSupplyIds(supply) {
+  return Object.keys(supply || {})
+    .sort(function(leftId, rightId) {
+      const left = getCardInfo(leftId);
+      const right = getCardInfo(rightId);
+
+      if (
+        left.supplyGroup !==
+        right.supplyGroup
+      ) {
+        return (
+          left.supplyGroup -
+          right.supplyGroup
+        );
+      }
+
+      return (
+        left.supplyOrder -
+        right.supplyOrder
+      );
+    });
+}
+
+
+function runActionWithRetry_(
+  starter,
+  onSuccess
+) {
+  pendingActions.push({
+    starter:starter,
+    onSuccess:onSuccess
+  });
+
+  processNextAction_();
+}
+
+function processNextAction_() {
+  if (
+    actionInProgress ||
+    pendingActions.length === 0
+  ) {
+    return;
+  }
+
+  currentActionTask =
+    pendingActions.shift();
+
+  actionInProgress = true;
+
+  const finishButton =
+    document.getElementById(
+      'finishPhaseButton'
+    );
+
+  if (finishButton) {
+    finishButton.disabled = true;
+  }
+
+  const taskSerial =
+    ++actionTaskSerial;
+
+  stopPolling();
+  setLoading(true);
+
+  publishFirebaseActionPending_(
+    currentActionTask &&
+    currentActionTask.label
+      ? currentActionTask.label
+      : 'player-action'
+  );
+
+  clearTimeout(
+    actionWatchdogTimer
+  );
+
+  /*
+   * Google Apps Script 偶爾可能因排隊或網路中斷沒有回呼。
+   * 15 秒後自動解除「處理中」，讓玩家可以重新嘗試。
+   */
+  actionWatchdogTimer =
+    setTimeout(function() {
+      if (
+        actionInProgress &&
+        taskSerial === actionTaskSerial
+      ) {
+        currentActionTask = null;
+        actionInProgress = false;
+        setLoading(false);
+        startPolling();
+
+        setSyncStatus(
+          '操作逾時，已恢復',
+          'offline'
+        );
+
+        showMessage(
+          '伺服器回應逾時，畫面已解除鎖定，請再試一次。',
+          true
+        );
+
+        syncClientState(true);
+        processNextAction_();
+      }
+    }, 15000);
+  setSyncStatus(
+    pendingActions.length > 0
+      ? '排隊 ' + pendingActions.length
+      : '處理中',
+    'busy'
+  );
+
+  let attempt = 0;
+
+  function execute() {
+    attempt += 1;
+
+    currentActionTask.starter(
+      function(result) {
+        if (
+          taskSerial !==
+          actionTaskSerial
+        ) {
+          return;
+        }
+
+        clearTimeout(
+          actionWatchdogTimer
+        );
+
+        const completedTask =
+          currentActionTask;
+
+        currentActionTask = null;
+        actionInProgress = false;
+        setLoading(false);
+        startPolling();
+
+        /*
+         * 操作後立即抓取完整遊戲狀態，
+         * 其餘時間只做輕量版本檢查。
+         */
+        setSyncStatus('更新中', 'busy');
+
+        if (completedTask.onSuccess) {
+          completedTask.onSuccess(result);
+        }
+
+        publishFirebaseActionComplete_(
+          completedTask &&
+          completedTask.label
+            ? completedTask.label
+            : 'player-action',
+          null
+        );
+
+        if (
+          typeof firebaseBridgePublishSignal ===
+            'function'
+        ) {
+          firebaseBridgePublishSignal(
+            'player-action'
+          );
+        }
+
+        fastSyncClientState(function(state) {
+          publishFirebasePublicState_(
+            state,
+            'player-action'
+          );
+        });
+
+        processNextAction_();
+      },
+      function(error) {
+        if (
+          taskSerial !==
+          actionTaskSerial
+        ) {
+          return;
+        }
+
+        clearTimeout(
+          actionWatchdogTimer
+        );
+
+        const message =
+          error && error.message
+            ? String(error.message)
+            : '';
+
+        const isBusy =
+          message.indexOf('BUSY:') !== -1;
+
+        if (
+          isBusy &&
+          attempt < ACTION_MAX_RETRIES
+        ) {
+          setTimeout(
+            execute,
+            ACTION_RETRY_DELAY_MS * attempt
+          );
+          return;
+        }
+
+        currentActionTask = null;
+        actionInProgress = false;
+        setLoading(false);
+        startPolling();
+        setSyncStatus('同步中', 'busy');
+
+        firebaseActionPending = null;
+        rollbackOptimisticPhase_();
+        unlockInteraction_(
+          'server-error'
+        );
+
+        showMessage(
+          isBusy
+            ? '伺服器忙碌，請再試一次。'
+            : (message || '操作失敗。'),
+          true
+        );
+
+        refreshRoomState();
+
+        setTimeout(function() {
+          processNextAction_();
+        }, 60);
+      }
+    );
+  }
+
+  execute();
+}
+
+function startPolling() {
+  stopPolling();
+
+  pollingTimer =
+    setInterval(
+      function() {
+        syncClientState(false);
+      },
+      SNAPSHOT_POLL_INTERVAL_MS
+    );
+}
+
+function stopPolling() {
+  if (pollingTimer) {
+    clearInterval(pollingTimer);
+    pollingTimer = null;
+  }
+}
+
+function saveRoomInformation(
+  playerName,
+  roomNumber
+) {
+  localStorage.setItem(
+    STORAGE_KEYS.playerName,
+    playerName
+  );
+
+  localStorage.setItem(
+    STORAGE_KEYS.roomNumber,
+    roomNumber
+  );
+}
+
+function showHome() {
+  if (
+    !currentRoomNumber &&
+    typeof firebaseBridgeLeaveRoom ===
+      'function'
+  ) {
+    firebaseBridgeLeaveRoom();
+  }
+
+  document
+    .getElementById('homeView')
+    .classList.remove('hidden');
+
+  document
+    .getElementById('lobbyView')
+    .classList.add('hidden');
+
+  document
+    .getElementById('gameView')
+    .classList.add('hidden');
+}
+
+function showLobby() {
+  document
+    .getElementById('homeView')
+    .classList.add('hidden');
+
+  document
+    .getElementById('lobbyView')
+    .classList.remove('hidden');
+
+  document
+    .getElementById('gameView')
+    .classList.add('hidden');
+}
+
+
+function openDeckInspector() {
+  const inspector =
+    latestGameState &&
+    latestGameState.player
+      ? latestGameState.player.deckInspector
+      : null;
+
+  if (!inspector) {
+    showMessage('目前沒有可顯示的牌組資料。', true);
+    return;
+  }
+
+  deckInspectorOpen = true;
+
+  const overlay =
+    document.getElementById('deckInspectorOverlay');
+
+  if (overlay) {
+    overlay.classList.remove('hidden');
+  }
+
+  renderDeckInspector();
+}
+
+function closeDeckInspector() {
+  deckInspectorOpen = false;
+
+  const overlay =
+    document.getElementById('deckInspectorOverlay');
+
+  if (overlay) {
+    overlay.classList.add('hidden');
+  }
+}
+
+function setDeckInspectorFilter(filter) {
+  deckInspectorFilter = filter || 'all';
+
+  document
+    .querySelectorAll('[data-deck-filter]')
+    .forEach(function(button) {
+      button.classList.toggle(
+        'selected',
+        button.getAttribute('data-deck-filter') === deckInspectorFilter
+      );
+    });
+
+  renderDeckInspector();
+}
+
+function renderDeckInspector() {
+  const inspector =
+    latestGameState &&
+    latestGameState.player
+      ? latestGameState.player.deckInspector
+      : null;
+
+  if (!inspector) return;
+
+  const summary = inspector.summary || {};
+  const metrics = document.getElementById('deckInspectorMetrics');
+
+  if (metrics) {
+    metrics.innerHTML =
+      createDeckMetricHtml_('總牌數', summary.totalCards || 0) +
+      createDeckMetricHtml_('行動卡', summary.actionCards || 0) +
+      createDeckMetricHtml_('寶物', summary.treasureCards || 0) +
+      createDeckMetricHtml_(
+        '勝利／詛咒',
+        Number(summary.victoryCards || 0) +
+        Number(summary.curseCards || 0)
+      );
+  }
+
+  const input = document.getElementById('deckInspectorSearch');
+  const keyword = String(input ? input.value : '')
+    .trim()
+    .toLowerCase();
+
+  const cards = (inspector.cards || [])
+    .filter(function(card) {
+      if (
+        deckInspectorFilter !== 'all' &&
+        card.type !== deckInspectorFilter
+      ) {
+        return false;
+      }
+
+      if (!keyword) return true;
+
+      return (
+        String(card.name || '').toLowerCase().indexOf(keyword) !== -1 ||
+        String(card.description || '').toLowerCase().indexOf(keyword) !== -1
+      );
+    });
+
+  const list = document.getElementById('deckInspectorList');
+  if (!list) return;
+
+  if (!cards.length) {
+    list.innerHTML =
+      '<div class="deck-inspector-empty">沒有符合條件的卡片</div>';
+    return;
+  }
+
+  list.innerHTML =
+    cards.map(createDeckInspectorCardHtml_).join('');
+}
+
+function createDeckMetricHtml_(label, value) {
+  return (
+    '<div class="deck-metric"><small>' +
+    escapeHtml(label) +
+    '</small><strong>' +
+    Number(value || 0) +
+    '</strong></div>'
+  );
+}
+
+function createDeckInspectorCardHtml_(card) {
+  const locations = [];
+
+  if (Number(card.hand || 0) > 0) {
+    locations.push('手牌 ' + card.hand);
+  }
+  if (Number(card.deck || 0) > 0) {
+    locations.push('牌庫 ' + card.deck);
+  }
+  if (Number(card.discard || 0) > 0) {
+    locations.push('棄牌堆 ' + card.discard);
+  }
+  if (Number(card.play || 0) > 0) {
+    locations.push('已打出 ' + card.play);
+  }
+
+  return (
+    '<div class="deck-inspector-card ' +
+    escapeHtml(card.cssClass || card.type) +
+    '"><div class="deck-inspector-card-main">' +
+    '<div class="deck-inspector-card-name">' +
+    escapeHtml(card.name) +
+    '<span>×' + Number(card.total || 0) + '</span></div>' +
+    '<div class="deck-inspector-card-description">' +
+    escapeHtml(card.description || '') +
+    '</div></div>' +
+    '<div class="deck-inspector-card-meta">' +
+    '<span class="deck-cost">費用 ' +
+    Number(card.cost || 0) +
+    '</span><span>' +
+    escapeHtml(locations.join('・')) +
+    '</span></div></div>'
+  );
+}
+
+
+function renderServerAdvanceStatus(state) {
+  const element =
+    document.getElementById(
+      'serverAdvanceStatus'
+    );
+
+  if (!element) return;
+
+  const paused =
+    Boolean(
+      state.serverAdvancePaused
+    );
+
+  element.classList.toggle(
+    'hidden',
+    !paused
+  );
+
+  if (paused) {
+    element.textContent =
+      '⏸ 無真人在線，遊戲已自動暫停；重新開啟頁面後會繼續。';
+  }
+}
+
+function renderTurnTimer(state) {
+  const timer =
+    state.timer || {};
+
+  const panel =
+    document.getElementById(
+      'turnTimerPanel'
+    );
+
+  if (!panel) return;
+
+  clearInterval(timerIntervalId);
+
+  if (!timer.enabled) {
+    panel.classList.add('hidden');
+    return;
+  }
+
+  panel.classList.remove('hidden');
+  roomTimerPaused =
+    Boolean(timer.paused);
+  timerTimeoutRequested = false;
+  lastTimerSecond = null;
+
+  const owner =
+    document.getElementById(
+      'turnTimerOwner'
+    );
+
+  if (owner) {
+    if (timer.paused) {
+      owner.textContent =
+        '計時已暫停';
+    } else if (
+      timer.isSimultaneousBuy
+    ) {
+      if (
+        timer.isViewerOwner &&
+        timer.aiControlled
+      ) {
+        owner.textContent =
+          timer.manualAiControl
+            ? 'AI 持續接管中，按「恢復真人控制」才會停止'
+            : 'AI 正在替你購買';
+      } else if (
+        timer.isViewerOwner
+      ) {
+        owner.textContent =
+          '你正在購買';
+      } else if (
+        timer.ownerName
+      ) {
+        owner.textContent =
+          timer.ownerName +
+          ' 尚未完成購買';
+      } else {
+        owner.textContent =
+          '等待所有玩家完成購買';
+      }
+    } else {
+      owner.textContent =
+        timer.isAiThinking
+          ? (
+              timer.manualAiControl
+                ? (
+                    timer.ownerName
+                      ? timer.ownerName +
+                        ' 由 AI 持續接管中'
+                      : 'AI 持續接管中'
+                  )
+                : (
+                    timer.ownerName
+                      ? timer.ownerName +
+                        ' 由 AI 操作中'
+                      : 'AI 操作中'
+                  )
+            )
+          : (
+              timer.ownerName
+                ? timer.ownerName + ' 思考中'
+                : '等待玩家操作'
+            );
+    }
+  }
+
+  renderPendingBuyerTimers_(timer);
+
+  const reclaim =
+    document.getElementById(
+      'reclaimControlButton'
+    );
+
+  const enableAi =
+    document.getElementById(
+      'enableAiControlButton'
+    );
+
+  const modeSelect =
+    document.getElementById(
+      'aiControlModeSelect'
+    );
+
+  if (reclaim) {
+    reclaim.classList.toggle(
+      'hidden',
+      !(
+        timer.isViewerOwner &&
+        timer.aiControlled
+      )
+    );
+  }
+
+  if (enableAi) {
+    enableAi.classList.toggle(
+      'hidden',
+      Boolean(
+        timer.isViewerOwner &&
+        timer.aiControlled
+      ) ||
+      state.gameOver
+    );
+  }
+
+  if (modeSelect) {
+    modeSelect.classList.toggle(
+      'hidden',
+      Boolean(
+        timer.isViewerOwner &&
+        timer.aiControlled
+      ) ||
+      state.gameOver
+    );
+  }
+
+  const pause =
+    document.getElementById(
+      'pauseTimerButton'
+    );
+
+  if (pause) {
+    pause.classList.toggle(
+      'hidden',
+      state.playerRole !== 'host'
+    );
+
+    pause.textContent =
+      timer.paused
+        ? '恢復計時'
+        : '暫停計時';
+  }
+
+  updateTurnTimerDisplay_(timer);
+
+  timerIntervalId =
+    setInterval(function() {
+      updateTurnTimerDisplay_(timer);
+    }, 250);
+}
+
+
+function renderPendingBuyerTimers_(timer) {
+  const container =
+    document.getElementById(
+      'pendingBuyerTimerList'
+    );
+
+  if (!container) return;
+
+  if (
+    !timer.isSimultaneousBuy
+  ) {
+    container.classList.add('hidden');
+    container.innerHTML = '';
+    return;
+  }
+
+  const pending =
+    Array.isArray(timer.pendingBuyers)
+      ? timer.pendingBuyers
+      : [];
+
+  container.classList.remove('hidden');
+
+  if (!pending.length) {
+    container.innerHTML =
+      '<span class="pending-buyer-done">' +
+      '✓ 所有玩家已完成購買' +
+      '</span>';
+    return;
+  }
+
+  container.innerHTML =
+    '<span class="pending-buyer-label">' +
+    '尚未完成購買：</span>' +
+    pending
+      .map(function(player) {
+        return (
+          '<span class="pending-buyer-chip' +
+          (
+            player.id === timer.ownerId
+              ? ' current'
+              : ''
+          ) +
+          '">' +
+          escapeHtml(player.name) +
+          (
+            player.aiControlled
+              ? '（AI 接管）'
+              : ''
+          ) +
+          '</span>'
+        );
+      })
+      .join('');
+}
+
+function updateTurnTimerDisplay_(timer) {
+  const text =
+    document.getElementById(
+      'turnTimerText'
+    );
+
+  const progress =
+    document.getElementById(
+      'turnTimerProgress'
+    );
+
+  const panel =
+    document.getElementById(
+      'turnTimerPanel'
+    );
+
+  if (!text || !progress || !panel) {
+    return;
+  }
+
+  if (timer.isAiThinking) {
+    text.textContent = 'AI';
+    progress.style.width = '100%';
+    panel.classList.remove(
+      'timer-warning',
+      'timer-danger'
+    );
+    return;
+  }
+
+  const total =
+    Math.max(
+      1,
+      Number(timer.thinkTimeSeconds || 1)
+    );
+
+  let remaining = total;
+
+  if (timer.paused) {
+    text.textContent = '暫停';
+    progress.style.width = '100%';
+    panel.classList.remove(
+      'timer-warning',
+      'timer-danger'
+    );
+    return;
+  }
+
+  if (timer.deadlineAt) {
+    remaining =
+      Math.max(
+        0,
+        Math.ceil(
+          (
+            new Date(timer.deadlineAt)
+              .getTime() -
+            Date.now()
+          ) / 1000
+        )
+      );
+  }
+
+  const minutes =
+    Math.floor(remaining / 60);
+
+  const seconds =
+    remaining % 60;
+
+  text.textContent =
+    String(minutes).padStart(2, '0') +
+    ':' +
+    String(seconds).padStart(2, '0');
+
+  progress.style.width =
+    Math.max(
+      0,
+      Math.min(
+        100,
+        remaining / total * 100
+      )
+    ) + '%';
+
+  panel.classList.toggle(
+    'timer-warning',
+    remaining <= 10 &&
+    remaining > 5
+  );
+
+  panel.classList.toggle(
+    'timer-danger',
+    remaining <= 5
+  );
+
+  if (
+    timer.countdownSound &&
+    timer.isViewerTimer &&
+    remaining <= 5 &&
+    remaining > 0 &&
+    remaining !== lastTimerSecond
+  ) {
+    playTimerBeep_(
+      remaining === 1
+        ? 880
+        : 620
+    );
+  }
+
+  lastTimerSecond = remaining;
+
+  /*
+   * V18.3 超時由每次伺服器同步統一處理。
+   * 即使目前玩家已關閉網頁，
+   * 其他在線玩家也能推動 AI 接管。
+   */
+  if (
+    remaining <= 0 &&
+    !timerTimeoutRequested
+  ) {
+    timerTimeoutRequested = true;
+
+    setTimeout(function() {
+      timerTimeoutRequested = false;
+      syncClientState(true);
+    }, 250);
+  }
+}
+
+function playTimerBeep_(frequency) {
+  try {
+    const AudioContextClass =
+      window.AudioContext ||
+      window.webkitAudioContext;
+
+    if (!AudioContextClass) return;
+
+    const context =
+      new AudioContextClass();
+
+    const oscillator =
+      context.createOscillator();
+
+    const gain =
+      context.createGain();
+
+    oscillator.frequency.value =
+      frequency || 620;
+
+    gain.gain.value = 0.04;
+
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start();
+
+    setTimeout(function() {
+      oscillator.stop();
+      context.close();
+    }, 90);
+  } catch (error) {
+    console.warn(
+      '計時提示音無法播放',
+      error
+    );
+  }
+}
+
+function requestRoomTimeoutClient() {
+  google.script.run
+    .withSuccessHandler(function() {
+      timerTimeoutRequested = false;
+      syncClientState(true);
+    })
+    .withFailureHandler(function(error) {
+      timerTimeoutRequested = false;
+      console.error(
+        '處理超時失敗',
+        error
+      );
+
+      setTimeout(function() {
+        syncClientState(true);
+      }, 800);
+    })
+    .processRoomTimeout(
+      currentRoomNumber,
+      playerId
+    );
+}
+
+
+function enableAiControlClient() {
+  const modeSelect =
+    document.getElementById(
+      'aiControlModeSelect'
+    );
+
+  const mode =
+    modeSelect
+      ? modeSelect.value
+      : 'balanced';
+
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .enableAiControl(
+          currentRoomNumber,
+          playerId,
+          mode
+        );
+    },
+    function(result) {
+      showMessage(result.message);
+
+      if (
+        typeof firebaseBridgePublishEvent ===
+          'function'
+      ) {
+        firebaseBridgePublishEvent(
+          'ai-control-changed',
+          {
+            playerId:playerId,
+            manual:true,
+            enabled:true
+          }
+        );
+      }
+
+      fastSyncClientState(function(state) {
+        publishFirebasePublicState_(
+          state,
+          'manual-ai-control'
+        );
+      });
+    }
+  );
+}
+
+function reclaimControlClient() {
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .reclaimPlayerControl(
+          currentRoomNumber,
+          playerId
+        );
+    },
+    function(result) {
+      showMessage(result.message);
+
+      if (
+        typeof firebaseBridgePublishEvent ===
+          'function'
+      ) {
+        firebaseBridgePublishEvent(
+          'ai-control-changed',
+          {
+            playerId:playerId,
+            manual:false,
+            enabled:false
+          }
+        );
+      }
+
+      fastSyncClientState(function(state) {
+        publishFirebasePublicState_(
+          state,
+          'reclaim-human-control'
+        );
+      });
+    }
+  );
+}
+
+function toggleTimerPauseClient() {
+  runActionWithRetry_(
+    function(success, failure) {
+      google.script.run
+        .withSuccessHandler(success)
+        .withFailureHandler(failure)
+        .setRoomTimerPaused(
+          currentRoomNumber,
+          playerId,
+          !roomTimerPaused
+        );
+    },
+    function(result) {
+      showMessage(result.message);
+      syncClientState(true);
+    }
+  );
+}
+
+function showGame() {
+  document
+    .getElementById('homeView')
+    .classList.add('hidden');
+
+  document
+    .getElementById('lobbyView')
+    .classList.add('hidden');
+
+  document
+    .getElementById('gameView')
+    .classList.remove('hidden');
+}
+
+function setLoading(isLoading) {
+  const element =
+    document.getElementById('loading');
+
+  clearTimeout(loadingSafetyTimer);
+  element.classList.toggle(
+    'hidden',
+    !isLoading
+  );
+
+  if (isLoading) {
+    loadingSafetyTimer =
+      setTimeout(function() {
+        actionInProgress = false;
+        currentActionTask = null;
+        element.classList.add('hidden');
+        startPolling();
+        setSyncStatus('連線異常', 'offline');
+        showMessage(
+          '操作逾時，請再試一次。',
+          true
+        );
+        processNextAction_();
+      }, 12000);
+  }
+}
+
+
+function repairStaleInteractionDomLock_() {
+  if (interactionLockState.locked) {
+    return;
+  }
+
+  const area =
+    document.getElementById(
+      'specialChoiceArea'
+    );
+
+  if (
+    area &&
+    area.classList.contains(
+      'interaction-pending'
+    )
+  ) {
+    clearSpecialChoicePending_();
+
+    addInteractionEvent_(
+      'REPAIR',
+      '移除殘留 interaction-pending'
+    );
+  }
+}
+
+setInterval(
+  repairStaleInteractionDomLock_,
+  500
+);
+
+function showMessage(text, isError) {
+  const element =
+    document.getElementById('message');
+
+  element.textContent = text;
+  element.classList.toggle(
+    'error',
+    Boolean(isError)
+  );
+  element.classList.add('show');
+
+  clearTimeout(messageTimer);
+
+  messageTimer =
+    setTimeout(function() {
+      element.classList.remove('show');
+    }, 3000);
+}
+
+
+function getClientCardTypes_(card) {
+  if (!card) return [];
+
+  if (
+    Array.isArray(card.types) &&
+    card.types.length
+  ) {
+    return card.types.map(
+      function(type) {
+        return String(type || '')
+          .trim()
+          .toLowerCase();
+      }
+    );
+  }
+
+  return card.type
+    ? [
+        String(card.type)
+          .trim()
+          .toLowerCase()
+      ]
+    : [];
+}
+
+function clientHasCardType_(
+  card,
+  type
+) {
+  return (
+    getClientCardTypes_(card)
+      .indexOf(
+        String(type || '')
+          .trim()
+          .toLowerCase()
+      ) !== -1
+  );
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#039;');
+}
+document.addEventListener(
+  'keydown',
+  function(event) {
+    if (
+      event.key === 'Escape' &&
+      deckInspectorOpen
+    ) {
+      closeDeckInspector();
+    }
+  }
+);
+
+</script>

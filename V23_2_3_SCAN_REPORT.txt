@@ -1,0 +1,4 @@
+EffectEngine.gs: 非卡片物件誤用 hasCardType_ 0 處
+Game.gs: 非卡片物件誤用 hasCardType_ 0 處
+AI.gs: 非卡片物件誤用 hasCardType_ 0 處
+Room.gs: 非卡片物件誤用 hasCardType_ 0 處

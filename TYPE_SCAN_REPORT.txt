@@ -1,0 +1,7 @@
+Cards.gs: 未發現舊式核心類型判斷
+AI.gs: 未發現舊式核心類型判斷
+Game.gs: 未發現舊式核心類型判斷
+EffectEngine.gs: 未發現舊式核心類型判斷
+Room.gs: 未發現舊式核心類型判斷
+Score.gs: 未發現舊式核心類型判斷
+Client.html: 未發現舊式核心類型判斷

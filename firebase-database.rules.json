@@ -1,0 +1,49 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "roomSignals": {
+      "$roomNumber": {
+        ".read": true,
+        ".write": true
+      }
+    },
+    "presence": {
+      "$roomNumber": {
+        ".read": true,
+        "$playerId": {
+          "sessions": {
+            "$sessionId": {
+              ".write": true,
+              ".validate": "newData.val() == null || (newData.hasChildren(['online','playerId','sessionId','changedAt']) && newData.child('online').val() == true)"
+            }
+          }
+        }
+      }
+    },
+    "roomState": {
+      "$roomNumber": {
+        ".read": true,
+        ".write": true,
+        ".validate": "newData.hasChildren(['actorId','version','updatedAt','state']) && newData.child('version').isNumber()"
+      }
+    },
+    "roomEvents": {
+      "$roomNumber": {
+        ".read": true,
+        "$eventId": {
+          ".write": true,
+          ".validate": "newData.hasChildren(['type','actorId','createdAt','payload'])"
+        }
+      }
+    },
+    "roomChats": {
+      "$roomNumber": {
+        ".read": true,
+        "$messageId": {
+          ".write": "newData.hasChildren(['playerId','playerName','text','type','createdAt']) && newData.child('playerId').isString() && newData.child('playerName').isString() && newData.child('playerName').val().length <= 30 && newData.child('text').isString() && newData.child('text').val().length > 0 && newData.child('text').val().length <= 200 && (newData.child('type').val() == 'player' || newData.child('type').val() == 'system')"
+        }
+      }
+    }
+  }
+}

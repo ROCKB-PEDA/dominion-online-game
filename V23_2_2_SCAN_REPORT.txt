@@ -1,0 +1,7 @@
+AI.gs: 錯誤 interaction 類型判斷 0 處；舊式卡片類型判斷 0 處
+Game.gs: 錯誤 interaction 類型判斷 0 處；舊式卡片類型判斷 0 處
+EffectEngine.gs: 錯誤 interaction 類型判斷 0 處；舊式卡片類型判斷 0 處
+Room.gs: 錯誤 interaction 類型判斷 0 處；舊式卡片類型判斷 0 處
+Cards.gs: 錯誤 interaction 類型判斷 0 處；舊式卡片類型判斷 0 處
+Score.gs: 錯誤 interaction 類型判斷 0 處；舊式卡片類型判斷 0 處
+Client.html: 錯誤 interaction 類型判斷 0 處；舊式卡片類型判斷 0 處

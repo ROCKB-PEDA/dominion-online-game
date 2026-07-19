@@ -1,0 +1,1043 @@
+<script src="https://www.gstatic.com/firebasejs/12.2.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/12.2.1/firebase-database-compat.js"></script>
+
+<script>
+(function() {
+  'use strict';
+
+  const firebaseConfig = {
+    apiKey:'AIzaSyA6B1pouW8qg3rW0XO9J_tMQpDpL-HJIF4',
+    authDomain:'kingdom-card-game-25b7c.firebaseapp.com',
+    databaseURL:'https://kingdom-card-game-25b7c-default-rtdb.asia-southeast1.firebasedatabase.app',
+    projectId:'kingdom-card-game-25b7c',
+    storageBucket:'kingdom-card-game-25b7c.firebasestorage.app',
+    messagingSenderId:'961389251998',
+    appId:'1:961389251998:web:d5efa34f0cdc9b92b41a8f',
+    measurementId:'G-3VE22M12J5'
+  };
+
+  let database = null;
+  let boundRoomNumber = '';
+  let boundPlayerId = '';
+  let sessionId =
+    'tab_' +
+    Date.now().toString(36) +
+    '_' +
+    Math.random().toString(36).slice(2, 9);
+
+  let signalRef = null;
+  let signalHandler = null;
+  let roomStateRef = null;
+  let roomStateHandler = null;
+  let roomEventsRef = null;
+  let roomEventsHandler = null;
+  let roomChatsRef = null;
+  let roomChatsHandler = null;
+  let lastRoomStateVersion = 0;
+  let lastRoomEventKey = '';
+  let connectionRef = null;
+  let connectionHandler = null;
+  let presenceListRef = null;
+  let presenceListHandler = null;
+  let presenceRef = null;
+  let heartbeatTimer = null;
+  let lastSignalNonce = '';
+  let syncDebounceTimer = null;
+  let debugListeners = [];
+
+  let debugState = {
+    connected:false,
+    reconnecting:false,
+    roomNumber:'',
+    playerId:'',
+    sentCount:0,
+    receivedCount:0,
+    onlineCount:0,
+    totalPresenceCount:0,
+    latencyMs:null,
+    lastSentAt:'',
+    lastReceivedAt:'',
+    lastError:'',
+    lastReason:'',
+    firebaseWriteMs:null,
+    appsScriptSnapshotMs:null,
+    totalSyncMs:null,
+    activeSessionCount:0,
+    events:[]
+  };
+
+  function cleanKey_(value) {
+    return String(value || '')
+      .replace(/[.#$\[\]\/]/g, '_')
+      .substring(0, 80);
+  }
+
+  function nowTime_() {
+    return new Date().toLocaleTimeString(
+      'zh-TW',
+      {hour12:false}
+    );
+  }
+
+  function notifyDebug_() {
+    debugListeners.forEach(function(listener) {
+      try {
+        listener(Object.assign({}, debugState));
+      } catch (error) {
+        console.error('Firebase debug listener error:', error);
+      }
+    });
+  }
+
+  function updateDebug_(changes) {
+    debugState =
+      Object.assign({}, debugState, changes || {});
+    notifyDebug_();
+  }
+
+  function recordError_(error) {
+    const message =
+      String(
+        error && error.message
+          ? error.message
+          : error || '未知錯誤'
+      );
+
+    updateDebug_({lastError:message});
+    console.error('Firebase Bridge error:', error);
+  }
+
+  function addDebugEvent_(text, type) {
+    const events = Array.isArray(debugState.events) ? debugState.events.slice() : [];
+    events.push({time:nowTime_(),text:String(text || ''),type:String(type || 'info')});
+    if (events.length > 20) events.splice(0,events.length - 20);
+    updateDebug_({events:events});
+  }
+
+  window.firebaseBridgeAddDebugEvent = addDebugEvent_;
+
+  function scheduleSnapshotSync_() {
+    clearTimeout(syncDebounceTimer);
+    const totalStartedAt = performance.now();
+    syncDebounceTimer = setTimeout(function() {
+      addDebugEvent_('開始讀取 Apps Script 最新快照','sync');
+      const snapshotStartedAt = performance.now();
+      const done = function() {
+        const snapshotMs = Math.round(performance.now() - snapshotStartedAt);
+        const totalMs = Math.round(performance.now() - totalStartedAt);
+        updateDebug_({appsScriptSnapshotMs:snapshotMs,totalSyncMs:totalMs});
+        addDebugEvent_('快照完成：' + snapshotMs + 'ms，完整同步 ' + totalMs + 'ms','success');
+      };
+      if (typeof fastSyncClientState === 'function') {
+        const started = fastSyncClientState(done);
+        if (started === false) done();
+      } else if (typeof syncClientState === 'function') {
+        syncClientState(true);
+        setTimeout(done,0);
+      }
+    },100);
+  }
+
+  function stopHeartbeat_() {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  }
+
+  function detachListeners_() {
+    clearTimeout(syncDebounceTimer);
+    stopHeartbeat_();
+
+    if (signalRef && signalHandler) {
+      signalRef.off('value', signalHandler);
+    }
+
+    if (roomStateRef && roomStateHandler) {
+      roomStateRef.off(
+        'value',
+        roomStateHandler
+      );
+    }
+
+    if (roomEventsRef && roomEventsHandler) {
+      roomEventsRef.off(
+        'child_added',
+        roomEventsHandler
+      );
+    }
+
+    if (roomChatsRef && roomChatsHandler) {
+      roomChatsRef.off(
+        'child_added',
+        roomChatsHandler
+      );
+    }
+
+    if (connectionRef && connectionHandler) {
+      connectionRef.off('value', connectionHandler);
+    }
+
+    if (presenceListRef && presenceListHandler) {
+      presenceListRef.off('value', presenceListHandler);
+    }
+
+    signalRef = null;
+    signalHandler = null;
+    roomStateRef = null;
+    roomStateHandler = null;
+    roomEventsRef = null;
+    roomEventsHandler = null;
+    roomChatsRef = null;
+    roomChatsHandler = null;
+    connectionRef = null;
+    connectionHandler = null;
+    presenceListRef = null;
+    presenceListHandler = null;
+  }
+
+  function writePresenceOnline_() {
+    if (!presenceRef) return;
+
+    const payload = {
+      online:true,
+      playerId:boundPlayerId,
+      sessionId:sessionId,
+      changedAt:
+        firebase.database.ServerValue.TIMESTAMP
+    };
+
+    presenceRef
+      .onDisconnect()
+      .remove()
+      .catch(recordError_);
+
+    presenceRef
+      .set(payload)
+      .catch(recordError_);
+  }
+
+  try {
+    if (!firebase.apps.length) {
+      firebase.initializeApp(firebaseConfig);
+    }
+
+    database = firebase.database();
+    window.firebaseBridgeReady = true;
+  } catch (error) {
+    window.firebaseBridgeReady = false;
+    recordError_(error);
+  }
+
+  window.firebaseBridgeSubscribeDebug =
+    function(listener) {
+      if (typeof listener !== 'function') {
+        return function() {};
+      }
+
+      debugListeners.push(listener);
+      listener(Object.assign({}, debugState));
+
+      return function() {
+        debugListeners =
+          debugListeners.filter(function(item) {
+            return item !== listener;
+          });
+      };
+    };
+
+
+  window.firebaseBridgeSetServerPerformance =
+    function(info) {
+      info = info || {};
+
+      updateDebug_({
+        serverCacheHit:
+          Boolean(info.cacheHit),
+        serverRoomLoadMs:
+          Number(info.roomLoadMs || 0),
+        serverTotalMs:
+          Number(info.totalMs || 0)
+      });
+
+      addDebugEvent_(
+        '伺服器快照：' +
+          (
+            info.cacheHit
+              ? '快取命中'
+              : '讀取試算表'
+          ) +
+          '，房間載入 ' +
+          Number(info.roomLoadMs || 0) +
+          'ms，總計 ' +
+          Number(info.totalMs || 0) +
+          'ms',
+        info.cacheHit
+          ? 'success'
+          : 'sync'
+      );
+    };
+
+  window.firebaseBridgeGetDebugState =
+    function() {
+      return Object.assign({}, debugState);
+    };
+
+
+  function stableHash_(value) {
+    const text =
+      JSON.stringify(value || {});
+
+    let hash = 2166136261;
+
+    for (
+      let index = 0;
+      index < text.length;
+      index++
+    ) {
+      hash ^= text.charCodeAt(index);
+
+      hash +=
+        (hash << 1) +
+        (hash << 4) +
+        (hash << 7) +
+        (hash << 8) +
+        (hash << 24);
+    }
+
+    return (
+      hash >>> 0
+    ).toString(16);
+  }
+
+  window.firebaseBridgeBindRoom =
+    function(roomNumber, playerId) {
+      if (!database) return;
+
+      roomNumber = cleanKey_(roomNumber);
+      playerId = cleanKey_(playerId);
+
+      if (!roomNumber || !playerId) return;
+
+      if (
+        boundRoomNumber === roomNumber &&
+        boundPlayerId === playerId
+      ) {
+        return;
+      }
+
+      window.firebaseBridgeLeaveRoom();
+
+      boundRoomNumber = roomNumber;
+      boundPlayerId = playerId;
+
+      updateDebug_({
+        roomNumber:roomNumber,
+        playerId:playerId,
+        lastError:''
+      });
+
+      signalRef =
+        database.ref(
+          'roomSignals/' + roomNumber
+        );
+
+      signalHandler =
+        function(snapshot) {
+          const value = snapshot.val();
+
+          if (!value) return;
+
+          const nonce = String(value.nonce || '');
+          if (!nonce) return;
+
+          if (!lastSignalNonce) {
+            lastSignalNonce = nonce;
+            return;
+          }
+
+          if (nonce === lastSignalNonce) return;
+
+          lastSignalNonce = nonce;
+
+          updateDebug_({
+            receivedCount:
+              Number(debugState.receivedCount || 0) + 1,
+            lastReceivedAt:nowTime_(),
+            lastReason:String(value.reason || '')
+          });
+
+          addDebugEvent_('收到更新訊號：' + String(value.reason || 'update'),'receive');
+          scheduleSnapshotSync_();
+        };
+
+      signalRef.on('value', signalHandler);
+
+      roomStateRef =
+        database.ref(
+          'roomState/' + roomNumber
+        );
+
+      roomStateHandler =
+        function(snapshot) {
+          const value = snapshot.val();
+
+          if (
+            !value ||
+            !value.state ||
+            value.actorId === boundPlayerId
+          ) {
+            return;
+          }
+
+          const version =
+            Number(value.version || 0);
+
+          if (
+            version > 0 &&
+            version <= lastRoomStateVersion
+          ) {
+            updateDebug_({
+              staleStateDrops:
+                Number(
+                  debugState.staleStateDrops || 0
+                ) + 1
+            });
+
+            addDebugEvent_(
+              '忽略過期狀態 v' +
+                version +
+                '，目前 v' +
+                lastRoomStateVersion,
+              'sync'
+            );
+
+            return;
+          }
+
+          lastRoomStateVersion = version;
+
+          updateDebug_({
+            roomStateVersion:version,
+            roomStateHash:
+              stableHash_(value.state),
+            packetsReceived:
+              Number(
+                debugState.packetsReceived || 0
+              ) + 1
+          });
+
+          updateDebug_({
+            receivedCount:
+              Number(
+                debugState.receivedCount || 0
+              ) + 1,
+            lastReceivedAt:nowTime_(),
+            lastReason:'firebase-room-state'
+          });
+
+          addDebugEvent_(
+            '收到 Firebase 公開狀態 v' +
+              version,
+            'receive'
+          );
+
+          if (
+            typeof applyFirebaseRoomSnapshot ===
+              'function'
+          ) {
+            applyFirebaseRoomSnapshot(
+              value.state,
+              value
+            );
+          }
+        };
+
+      roomStateRef.on(
+        'value',
+        roomStateHandler
+      );
+
+      roomEventsRef =
+        database.ref(
+          'roomEvents/' + roomNumber
+        );
+
+      roomEventsHandler =
+        function(snapshot) {
+          const key = snapshot.key || '';
+          const event = snapshot.val();
+
+          if (
+            !event ||
+            key === lastRoomEventKey
+          ) {
+            return;
+          }
+
+          lastRoomEventKey = key;
+
+          const eventTime =
+            Number(
+              event.clientCreatedAt ||
+              event.createdAt ||
+              0
+            );
+
+          const delay =
+            eventTime
+              ? Math.max(
+                  0,
+                  Date.now() - eventTime
+                )
+              : null;
+
+          updateDebug_({
+            packetsReceived:
+              Number(
+                debugState.packetsReceived || 0
+              ) + 1,
+            realtimeEventDelayMs:delay
+          });
+
+          addDebugEvent_(
+            '即時事件：' +
+              String(
+                event.type || 'event'
+              ) +
+              (
+                delay == null
+                  ? ''
+                  : '（' + delay + 'ms）'
+              ),
+            'receive'
+          );
+
+          if (
+            typeof handleFirebaseRoomEvent ===
+              'function'
+          ) {
+            handleFirebaseRoomEvent(
+              event,
+              key
+            );
+          }
+        };
+
+      roomEventsRef
+        .limitToLast(30)
+        .on(
+          'child_added',
+          roomEventsHandler
+        );
+
+      roomChatsRef =
+        database.ref(
+          'roomChats/' + roomNumber
+        );
+
+      roomChatsHandler =
+        function(snapshot) {
+          const message =
+            snapshot.val();
+
+          if (!message) return;
+
+          message.id =
+            snapshot.key || '';
+
+          if (
+            typeof handleFirebaseChatMessage ===
+              'function'
+          ) {
+            handleFirebaseChatMessage(
+              message
+            );
+          }
+        };
+
+      roomChatsRef
+        .limitToLast(100)
+        .on(
+          'child_added',
+          roomChatsHandler
+        );
+
+      presenceRef =
+        database.ref(
+          'presence/' +
+          roomNumber +
+          '/' +
+          playerId +
+          '/sessions/' +
+          sessionId
+        );
+
+      connectionRef =
+        database.ref('.info/connected');
+
+      connectionHandler =
+        function(snapshot) {
+          const connected =
+            snapshot.val() === true;
+
+          updateDebug_({connected:connected,reconnecting:!connected});
+          addDebugEvent_(connected ? 'Firebase 已連線' : 'Firebase 連線中斷',connected ? 'success' : 'error');
+
+          if (!connected) {
+            stopHeartbeat_();
+            return;
+          }
+
+          writePresenceOnline_();
+
+          stopHeartbeat_();
+          heartbeatTimer =
+            setInterval(
+              writePresenceOnline_,
+              15000
+            );
+        };
+
+      connectionRef.on(
+        'value',
+        connectionHandler
+      );
+
+      presenceListRef =
+        database.ref(
+          'presence/' + roomNumber
+        );
+
+      presenceListHandler =
+        function(snapshot) {
+          const raw = snapshot.val() || {};
+          const playerIds = Object.keys(raw);
+          const normalized = {};
+          let onlineCount = 0;
+
+          playerIds.forEach(function(id) {
+            const sessions =
+              raw[id] && raw[id].sessions
+                ? raw[id].sessions
+                : {};
+
+            const sessionIds =
+              Object.keys(sessions);
+
+            const isOnline =
+              sessionIds.some(function(key) {
+                return Boolean(
+                  sessions[key] &&
+                  sessions[key].online
+                );
+              });
+
+            normalized[id] = {
+              online:isOnline,
+              sessionCount:sessionIds.length
+            };
+
+            if (isOnline) {
+              onlineCount += 1;
+            }
+          });
+
+          updateDebug_({
+            onlineCount:onlineCount,
+            totalPresenceCount:playerIds.length,
+            activeSessionCount:Object.keys(normalized).reduce(function(total,id){
+              return total + Number(normalized[id].sessionCount || 0);
+            },0)
+          });
+
+          if (
+            typeof renderFirebasePresenceState ===
+              'function'
+          ) {
+            renderFirebasePresenceState(normalized);
+          }
+        };
+
+      presenceListRef.on(
+        'value',
+        presenceListHandler
+      );
+    };
+
+
+
+
+  window.firebaseBridgeSendChatMessage =
+    function(playerName, text, type) {
+      if (
+        !database ||
+        !boundRoomNumber ||
+        !boundPlayerId
+      ) {
+        return Promise.resolve({
+          success:false,
+          message:'Firebase 尚未連線房間。'
+        });
+      }
+
+      text =
+        String(text || '')
+          .trim()
+          .substring(0, 200);
+
+      playerName =
+        String(playerName || '玩家')
+          .trim()
+          .substring(0, 30);
+
+      if (!text) {
+        return Promise.resolve({
+          success:false,
+          message:'訊息不能是空白。'
+        });
+      }
+
+      const message = {
+        playerId:boundPlayerId,
+        playerName:playerName || '玩家',
+        text:text,
+        type:
+          type === 'system'
+            ? 'system'
+            : 'player',
+        createdAt:
+          firebase.database
+            .ServerValue
+            .TIMESTAMP,
+        clientCreatedAt:Date.now()
+      };
+
+      return database
+        .ref(
+          'roomChats/' +
+          boundRoomNumber
+        )
+        .push(message)
+        .then(function() {
+          return {
+            success:true
+          };
+        })
+        .catch(function(error) {
+          recordError_(error);
+
+          return {
+            success:false,
+            message:
+              error && error.message
+                ? error.message
+                : '訊息送出失敗。'
+          };
+        });
+    };
+
+  window.firebaseBridgePublishEvent =
+    function(type, payload) {
+      if (
+        !database ||
+        !boundRoomNumber
+      ) {
+        return Promise.resolve(false);
+      }
+
+      const event = {
+        type:
+          String(type || 'event')
+            .substring(0, 50),
+        actorId:boundPlayerId,
+        createdAt:
+          firebase.database
+            .ServerValue
+            .TIMESTAMP,
+        clientCreatedAt:Date.now(),
+        payload:payload || {}
+      };
+
+      updateDebug_({
+        packetsSent:
+          Number(
+            debugState.packetsSent || 0
+          ) + 1
+      });
+
+      addDebugEvent_(
+        '發布即時事件：' +
+          event.type,
+        'send'
+      );
+
+      return database
+        .ref(
+          'roomEvents/' +
+          boundRoomNumber
+        )
+        .push(event)
+        .then(function() {
+          return true;
+        })
+        .catch(function(error) {
+          recordError_(error);
+          return false;
+        });
+    };
+
+  window.firebaseBridgePublishRoomState =
+    function(publicState, reason) {
+      if (
+        !database ||
+        !boundRoomNumber ||
+        !publicState
+      ) {
+        return Promise.resolve(false);
+      }
+
+      const startedAt =
+        performance.now();
+
+      const version =
+        Number(
+          publicState.version || 0
+        );
+
+      lastRoomStateVersion =
+        Math.max(
+          lastRoomStateVersion,
+          version
+        );
+
+      updateDebug_({
+        sentCount:
+          Number(
+            debugState.sentCount || 0
+          ) + 1,
+        lastSentAt:nowTime_(),
+        lastReason:
+          String(reason || 'room-state')
+      });
+
+      addDebugEvent_(
+        '發布 Firebase 公開狀態 v' +
+          version,
+        'send'
+      );
+
+      const targetRef =
+        database.ref(
+          'roomState/' +
+          boundRoomNumber
+        );
+
+      return targetRef
+        .transaction(function(current) {
+          const currentVersion =
+            current
+              ? Number(
+                  current.version || 0
+                )
+              : 0;
+
+          if (
+            version > 0 &&
+            currentVersion > version
+          ) {
+            return;
+          }
+
+          return {
+            actorId:boundPlayerId,
+            version:version,
+            reason:
+              String(
+                reason || 'room-state'
+              ).substring(0, 40),
+            updatedAt:
+              firebase.database
+                .ServerValue
+                .TIMESTAMP,
+            state:publicState
+          };
+        })
+        .then(function(result) {
+          const elapsed =
+            Math.round(
+              performance.now() -
+              startedAt
+            );
+
+          const committed =
+            !result ||
+            result.committed !== false;
+
+          updateDebug_({
+            firebaseWriteMs:elapsed,
+            latencyMs:elapsed,
+            lastError:'',
+            roomStateVersion:version,
+            roomStateHash:
+              stableHash_(publicState),
+            packetsSent:
+              Number(
+                debugState.packetsSent || 0
+              ) + 1,
+            staleStateDrops:
+              committed
+                ? Number(
+                    debugState.staleStateDrops || 0
+                  )
+                : Number(
+                    debugState.staleStateDrops || 0
+                  ) + 1
+          });
+
+          addDebugEvent_(
+            '公開狀態寫入完成：' +
+              elapsed +
+              'ms',
+            'success'
+          );
+
+          return true;
+        })
+        .catch(function(error) {
+          recordError_(error);
+          return false;
+        });
+    };
+
+  window.firebaseBridgePublishSignal =
+    function(reason) {
+      if (!database || !boundRoomNumber) {
+        return Promise.resolve(false);
+      }
+
+      const nonce =
+        Date.now() +
+        '_' +
+        Math.random().toString(36).slice(2, 10);
+
+      lastSignalNonce = nonce;
+
+      const startedAt = performance.now();
+
+      updateDebug_({sentCount:Number(debugState.sentCount || 0) + 1,lastSentAt:nowTime_(),lastReason:String(reason || 'update')});
+      addDebugEvent_('送出更新訊號：' + String(reason || 'update'),'send');
+
+      return database
+        .ref(
+          'roomSignals/' + boundRoomNumber
+        )
+        .set({
+          nonce:nonce,
+          reason:String(reason || 'update').substring(0, 40),
+          actorId:boundPlayerId,
+          updatedAt:
+            firebase.database.ServerValue.TIMESTAMP
+        })
+        .then(function() {
+          updateDebug_({
+            latencyMs:
+              Math.round(
+                performance.now() - startedAt
+              ),
+            lastError:''
+          });
+
+          return true;
+        })
+        .catch(function(error) {
+          recordError_(error);
+          return false;
+        });
+    };
+
+  window.firebaseBridgeTestSnapshot = function() {
+    if (typeof fastSyncClientState !== 'function') return Promise.resolve(false);
+    const started = performance.now();
+    addDebugEvent_('開始 Apps Script 快照測試','sync');
+    return new Promise(function(resolve){
+      fastSyncClientState(function(){
+        const ms = Math.round(performance.now() - started);
+        updateDebug_({appsScriptSnapshotMs:ms});
+        addDebugEvent_('Apps Script 快照完成：' + ms + 'ms','success');
+        resolve(true);
+      });
+    });
+  };
+
+  window.firebaseBridgeTestFullSync = function() {
+    const started = performance.now();
+    return window.firebaseBridgePublishSignal('full-sync-test').then(function(ok){
+      if (!ok) return false;
+      return new Promise(function(resolve){
+        setTimeout(function(){
+          fastSyncClientState(function(){
+            const ms = Math.round(performance.now() - started);
+            updateDebug_({totalSyncMs:ms});
+            addDebugEvent_('完整同步測試完成：' + ms + 'ms','success');
+            resolve(true);
+          });
+        },80);
+      });
+    });
+  };
+
+  window.firebaseBridgeSendTestSignal =
+    function() {
+      if (!boundRoomNumber) {
+        recordError_(
+          new Error('尚未進入房間，無法測試 Firebase。')
+        );
+
+        return Promise.resolve(false);
+      }
+
+      return window.firebaseBridgePublishSignal(
+        'debug-test'
+      );
+    };
+
+  window.firebaseBridgeLeaveRoom =
+    function() {
+      detachListeners_();
+
+      if (presenceRef) {
+        presenceRef
+          .onDisconnect()
+          .cancel();
+
+        presenceRef.remove();
+      }
+
+      boundRoomNumber = '';
+      boundPlayerId = '';
+      presenceRef = null;
+      lastSignalNonce = '';
+      lastRoomStateVersion = 0;
+      lastRoomEventKey = '';
+
+      updateDebug_({
+        connected:false,
+        reconnecting:false,
+        roomNumber:'',
+        playerId:'',
+        onlineCount:0,
+        totalPresenceCount:0
+      });
+    };
+
+  window.addEventListener(
+    'beforeunload',
+    function() {
+      if (presenceRef) {
+        presenceRef.remove();
+      }
+    }
+  );
+})();
+</script>

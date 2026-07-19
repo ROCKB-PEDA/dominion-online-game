@@ -1,0 +1,7 @@
+{
+  "getAiBuyScore_definitions": 1,
+  "evaluateAiPurchase_definitions": 1,
+  "chooseAiPurchaseCard_definitions": 1,
+  "chooseAiSupplyCard_definitions": 1,
+  "old_allowed_type_checks": 0
+}
