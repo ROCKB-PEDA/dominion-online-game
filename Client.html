@@ -3305,6 +3305,7 @@ function renderGameState(state) {
   renderEmptyPiles(state.supply || {});
   renderLog(state.log || []);
   renderResult(state);
+  renderPlayerControlPanel(state);
   renderTurnTimer(state);
   renderServerAdvanceStatus(state);
 
@@ -5905,6 +5906,82 @@ function renderServerAdvanceStatus(state) {
   }
 }
 
+function renderPlayerControlPanel(state) {
+  const panel =
+    document.getElementById(
+      'playerControlPanel'
+    );
+
+  if (!panel) return;
+
+  const viewerPlayer =
+    state.player || {};
+
+  const isPermanentAi =
+    Boolean(viewerPlayer.isAi);
+
+  const isAiControlled =
+    !isPermanentAi &&
+    Boolean(viewerPlayer.aiControlled);
+
+  const gameOver =
+    Boolean(state.gameOver);
+
+  const status =
+    document.getElementById(
+      'playerControlStatus'
+    );
+
+  const enableAi =
+    document.getElementById(
+      'enableAiControlButton'
+    );
+
+  const reclaim =
+    document.getElementById(
+      'reclaimControlButton'
+    );
+
+  const modeSelect =
+    document.getElementById(
+      'aiControlModeSelect'
+    );
+
+  panel.classList.toggle(
+    'hidden',
+    isPermanentAi || gameOver
+  );
+
+  if (status) {
+    status.textContent =
+      isAiControlled
+        ? 'AI 接管中'
+        : '真人操作中';
+  }
+
+  if (enableAi) {
+    enableAi.classList.toggle(
+      'hidden',
+      isAiControlled
+    );
+  }
+
+  if (reclaim) {
+    reclaim.classList.toggle(
+      'hidden',
+      !isAiControlled
+    );
+  }
+
+  if (modeSelect) {
+    modeSelect.classList.toggle(
+      'hidden',
+      isAiControlled
+    );
+  }
+}
+
+
 function renderTurnTimer(state) {
   const timer =
     state.timer || {};
@@ -5918,22 +5995,12 @@ function renderTurnTimer(state) {
 
   clearInterval(timerIntervalId);
 
-  /*
-   * V25.2.1 Player Control：
-   * AI 接管／恢復真人是玩家控制功能，不應依賴是否啟用回合計時。
-   * 因此即使房間設定為「不限時間」，仍保留控制面板與按鈕。
-   */
+  if (!timer.enabled) {
+    panel.classList.add('hidden');
+    return;
+  }
+
   panel.classList.remove('hidden');
-
-  const viewerPlayer =
-    state.player || {};
-
-  const viewerIsPermanentAi =
-    Boolean(viewerPlayer.isAi);
-
-  const viewerAiControlled =
-    !viewerIsPermanentAi &&
-    Boolean(viewerPlayer.aiControlled);
 
   roomTimerPaused =
     Boolean(timer.paused);
@@ -6003,85 +6070,6 @@ function renderTurnTimer(state) {
 
   renderPendingBuyerTimers_(timer);
 
-  const reclaim =
-    document.getElementById(
-      'reclaimControlButton'
-    );
-
-  const enableAi =
-    document.getElementById(
-      'enableAiControlButton'
-    );
-
-  const modeSelect =
-    document.getElementById(
-      'aiControlModeSelect'
-    );
-
-  if (reclaim) {
-    reclaim.classList.toggle(
-      'hidden',
-      !viewerAiControlled ||
-      state.gameOver
-    );
-  }
-
-  if (enableAi) {
-    enableAi.classList.toggle(
-      'hidden',
-      viewerIsPermanentAi ||
-      viewerAiControlled ||
-      state.gameOver
-    );
-  }
-
-  if (modeSelect) {
-    modeSelect.classList.toggle(
-      'hidden',
-      viewerIsPermanentAi ||
-      viewerAiControlled ||
-      state.gameOver
-    );
-  }
-
-  if (!timer.enabled) {
-    if (owner) {
-      owner.textContent =
-        viewerAiControlled
-          ? 'AI 持續接管中，按「恢復真人控制」才會停止'
-          : '不限時間模式';
-    }
-
-    const timerText =
-      document.getElementById(
-        'turnTimerText'
-      );
-
-    const timerProgress =
-      document.getElementById(
-        'turnTimerProgress'
-      );
-
-    if (timerText) {
-      timerText.textContent =
-        viewerAiControlled ? 'AI' : '∞';
-    }
-
-    if (timerProgress) {
-      timerProgress.style.width = '100%';
-    }
-
-    panel.classList.remove(
-      'timer-warning',
-      'timer-danger'
-    );
-
-    renderPendingBuyerTimers_({
-      isSimultaneousBuy:false,
-      pendingBuyers:[]
-    });
-  }
-
   const pause =
     document.getElementById(
       'pauseTimerButton'
@@ -6098,10 +6086,6 @@ function renderTurnTimer(state) {
       timer.paused
         ? '恢復計時'
         : '暫停計時';
-  }
-
-  if (!timer.enabled) {
-    return;
   }
 
   updateTurnTimerDisplay_(timer);

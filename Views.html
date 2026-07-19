@@ -168,6 +168,43 @@
 
       <div id="serverAdvanceStatus" class="server-advance-status hidden"></div>
 
+      <div id="playerControlPanel" class="player-control-panel">
+        <div class="player-control-info">
+          <small>玩家控制</small>
+          <strong id="playerControlStatus">真人操作中</strong>
+        </div>
+
+        <div class="player-control-buttons">
+          <select
+            id="aiControlModeSelect"
+            class="ai-control-mode-select"
+            aria-label="AI 接管模式"
+          >
+            <option value="balanced">AI：平衡</option>
+            <option value="conservative">AI：保守</option>
+            <option value="aggressive">AI：積極</option>
+          </select>
+
+          <button
+            id="enableAiControlButton"
+            class="btn btn-secondary"
+            type="button"
+            onclick="enableAiControlClient()"
+          >
+            🤖 AI 接管
+          </button>
+
+          <button
+            id="reclaimControlButton"
+            class="btn btn-secondary hidden"
+            type="button"
+            onclick="reclaimControlClient()"
+          >
+            👤 恢復真人控制
+          </button>
+        </div>
+      </div>
+
       <div id="turnTimerPanel" class="turn-timer-panel hidden">
         <div class="turn-timer-row">
           <div>
@@ -176,33 +213,6 @@
           </div>
 
           <div class="timer-control-buttons">
-            <select
-              id="aiControlModeSelect"
-              class="ai-control-mode-select"
-            >
-              <option value="balanced">AI：平衡</option>
-              <option value="conservative">AI：保守</option>
-              <option value="aggressive">AI：積極</option>
-            </select>
-
-            <button
-              id="enableAiControlButton"
-              class="btn btn-secondary"
-              type="button"
-              onclick="enableAiControlClient()"
-            >
-              🤖 AI 持續接管
-            </button>
-
-            <button
-              id="reclaimControlButton"
-              class="btn btn-secondary hidden"
-              type="button"
-              onclick="reclaimControlClient()"
-            >
-              👤 恢復真人控制
-            </button>
-
             <button
               id="pauseTimerButton"
               class="btn btn-secondary hidden"
