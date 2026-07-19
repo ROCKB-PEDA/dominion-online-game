@@ -442,6 +442,51 @@ button{cursor:pointer}
 .lobby-timer-summary strong{
   color:#f2d487
 }
+
+.player-control-panel{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin:12px 0;
+  padding:12px 14px;
+  border:1px solid rgba(239,211,132,.55);
+  border-radius:12px;
+  background:#102e2b
+}
+.player-control-info small,
+.player-control-info strong{display:block}
+.player-control-info small{
+  color:#bfd3ce;
+  font-size:12px
+}
+.player-control-info strong{
+  margin-top:3px;
+  color:#f2d487;
+  font-size:16px
+}
+.player-control-buttons{
+  display:flex;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+  gap:8px
+}
+@media(max-width:560px){
+  .player-control-panel{
+    align-items:stretch;
+    flex-direction:column
+  }
+  .player-control-buttons{
+    display:grid;
+    grid-template-columns:1fr 1fr
+  }
+  .player-control-buttons .ai-control-mode-select{
+    grid-column:1 / -1;
+    width:100%
+  }
+  .player-control-buttons .btn{width:100%}
+}
+
 .turn-timer-panel{
   margin:12px 0;
   padding:12px 14px;
